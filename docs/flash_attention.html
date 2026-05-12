@@ -1,0 +1,395 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Flash Attention — LeetGPU</title>
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+
+<nav class="topnav">
+    <span class="brand">leetgpu/</span>
+    <a href="index.html">index</a>
+    <a href="primer.html">primer</a>
+    <a href="transpose.html">transpose</a>
+    <a href="vector_addition.html">vector_addition</a>
+    <a href="softmax.html">softmax</a>
+    <a href="topk.html">topk</a>
+    <a href="attention.html">attention</a>
+    <a href="flash_attention.html">flash_attention</a>
+    <span class="spacer"></span>
+    <span class="dim">target: GTX 1660 Super</span>
+</nav>
+
+<main>
+
+<h1>Flash Attention</h1>
+
+<div class="callout">
+    <strong>TL;DR.</strong> Same math as <a href="attention.html">naive
+    attention</a>, but the entire pipeline runs in <strong>one fused kernel</strong>
+    that <em>never materializes</em> the <code>[M × N]</code> scores matrix.
+    Each CTA owns one query row and walks across all N keys once, updating
+    three tiny running scalars (<code>m</code>, <code>l</code>, <code>acc</code>)
+    after each key. The price: K and V are re-read N times. The win:
+    sequence lengths that would otherwise blow out DRAM (and L2) just keep working.
+</div>
+
+<p class="small dim">
+    Source: <a href="../flash_attention.cu">/workspaces/leetgpu-master/flash_attention.cu</a>.
+</p>
+
+<div class="legend">
+    <span><span class="swatch" style="background:#ffebe9;border-color:#cf222e"></span>DRAM</span>
+    <span><span class="swatch" style="background:#fff1cf;border-color:#bf8700"></span>L2</span>
+    <span><span class="swatch" style="background:#fff8c5;border-color:#9a6700"></span>L1 / shared</span>
+    <span><span class="swatch" style="background:#dafbe1;border-color:#1a7f37"></span>register</span>
+    <span><span class="swatch" style="background:#fbefff;border-color:#8250df"></span>warp</span>
+</div>
+
+<!-- ===================================================================== -->
+<h2>1. The core insight</h2>
+
+<p>
+    Naive attention has to build the full scores matrix because softmax needs
+    <em>the whole row</em> to compute its denominator. You can't normalize
+    until you've seen every key.
+</p>
+
+<p>
+    Flash attention's trick is the <strong>online softmax</strong>: as you
+    visit keys one at a time, maintain
+</p>
+
+<table>
+<tr><th>Variable</th><th>Meaning</th><th>Lives in</th></tr>
+<tr><td><code>m</code></td><td>running max of scores seen so far</td><td>register (per-thread, redundantly)</td></tr>
+<tr><td><code>l</code></td><td>running sum of <code>exp(score − m)</code></td><td>register</td></tr>
+<tr><td><code>acc</code></td><td>running sum of <code>weight × V</code> for this thread's output dim</td><td>register</td></tr>
+</table>
+
+<p>
+    Whenever a new key produces a larger score, the previous accumulators are
+    <em>rescaled</em> by <code>exp(m_old − m_new)</code> — math that's
+    equivalent to having normalized with the right max all along. After N keys,
+    divide <code>acc</code> by <code>l</code> and write to output. Done.
+</p>
+
+<div class="callout">
+    Total extra state: O(d) per CTA (one register slot for each output dim).
+    The naive version's [M × N] matrix becomes nothing.
+</div>
+
+<!-- ===================================================================== -->
+<h2>2. The math, with proof of equivalence</h2>
+
+<p>
+    For one query <em>i</em> and keys <em>j = 0..N-1</em>:
+</p>
+
+<pre><code>true softmax:    p_j = exp(s_j - row_max) / Σ_k exp(s_k - row_max)
+                 O   = Σ_j p_j · V[j]
+
+flash form:      after key j, given (m, l, acc) reflecting keys 0..j-1:
+                 m_new   = max(m, s_j)
+                 corr    = exp(m - m_new)        // ≤ 1, rescales old state
+                 p_j_raw = exp(s_j - m_new)
+                 l       = l · corr + p_j_raw    // new running sum
+                 acc     = acc · corr + p_j_raw · V[j]
+                 m       = m_new
+
+after all N:     O = acc / l                     // ≡ true softmax above</code></pre>
+
+<p>
+    Why it's equivalent: every term in <code>acc</code> and <code>l</code> is
+    consistently expressed relative to the <em>current</em> max <code>m</code>.
+    When <code>m</code> changes, both numerator and denominator get the same
+    <code>corr</code> multiplier, so the final ratio <code>acc / l</code>
+    is unchanged.
+</p>
+
+<!-- ===================================================================== -->
+<h2>3. The whole kernel, annotated</h2>
+
+<div class="code-block">
+<pre data-start-line="91" style="--start-line: 91;"><code><span class="line"><span class="kw">__global__</span> <span class="ty">void</span> <span class="fn">flashAttentionKernel</span>(<span class="kw">const</span> <span class="ty">float</span>* <span class="kw">__restrict__</span> Q,</span><span class="line">                                      <span class="kw">const</span> <span class="ty">float</span>* <span class="kw">__restrict__</span> K,</span><span class="line">                                      <span class="kw">const</span> <span class="ty">float</span>* <span class="kw">__restrict__</span> V,</span><span class="line">                                      <span class="ty">float</span>* <span class="kw">__restrict__</span> O,</span><span class="line">                                      <span class="ty">int</span> M, <span class="ty">int</span> N, <span class="ty">int</span> d, <span class="ty">float</span> scale) {</span><span class="line">    <span class="kw">const</span> <span class="ty">int</span> i = blockIdx.x;                  <span class="cmt">// one CTA per query row</span></span><span class="line">    <span class="kw">const</span> <span class="ty">int</span> t = threadIdx.x;</span><span class="line">    <span class="kw">const</span> <span class="ty">int</span> T = blockDim.x;                  <span class="cmt">// power-of-2 ≥ d</span></span><span class="line"></span><span class="line">    <span class="kw">extern</span> <span class="kw">__shared__</span> <span class="ty">float</span> smem[];</span><span class="line">    <span class="ty">float</span>* q_sh = smem;                       <span class="cmt">// [d] query vector for row i</span></span><span class="line">    <span class="ty">float</span>* red  = smem + d;                   <span class="cmt">// [T] reduction scratch</span></span><span class="line"></span><span class="line">    <span class="kw">if</span> (t &lt; d) q_sh[t] = Q[i * d + t];        <span class="cmt">// load Q row once</span></span><span class="line">    <span class="fn">__syncthreads</span>();</span><span class="line"></span><span class="line">    <span class="ty">float</span> m   = -FLT_MAX;                      <span class="cmt">// running max</span></span><span class="line">    <span class="ty">float</span> l   = <span class="num">0.0f</span>;                          <span class="cmt">// running denominator</span></span><span class="line">    <span class="ty">float</span> acc = <span class="num">0.0f</span>;                          <span class="cmt">// running output (for this thread's k = t)</span></span><span class="line"></span><span class="line">    <span class="kw">for</span> (<span class="ty">int</span> j = <span class="num">0</span>; j &lt; N; j++) {</span><span class="line">        <span class="cmt">// dot product Q[i] · K[j] via a block reduction over the d dim</span></span><span class="line">        red[t] = (t &lt; d) ? q_sh[t] * K[j * d + t] : <span class="num">0.0f</span>;</span><span class="line">        <span class="fn">__syncthreads</span>();</span><span class="line">        <span class="kw">for</span> (<span class="ty">int</span> s = T &gt;&gt; <span class="num">1</span>; s &gt; <span class="num">0</span>; s &gt;&gt;= <span class="num">1</span>) {</span><span class="line">            <span class="kw">if</span> (t &lt; s) red[t] += red[t + s];</span><span class="line">            <span class="fn">__syncthreads</span>();</span><span class="line">        }</span><span class="line">        <span class="kw">const</span> <span class="ty">float</span> s_j = red[<span class="num">0</span>] * scale;             <span class="cmt">// every thread reads the same broadcast</span></span><span class="line"></span><span class="line">        <span class="cmt">// streaming softmax update — all in registers, all in one cycle</span></span><span class="line">        <span class="kw">const</span> <span class="ty">float</span> m_new = <span class="fn">fmaxf</span>(m, s_j);</span><span class="line">        <span class="kw">const</span> <span class="ty">float</span> corr  = <span class="fn">__expf</span>(m - m_new);</span><span class="line">        <span class="kw">const</span> <span class="ty">float</span> p     = <span class="fn">__expf</span>(s_j - m_new);</span><span class="line">        l = l * corr + p;</span><span class="line">        <span class="kw">if</span> (t &lt; d) acc = acc * corr + p * V[j * d + t];</span><span class="line">        m = m_new;</span><span class="line">        <span class="fn">__syncthreads</span>();                          <span class="cmt">// before overwriting red[t] next iter</span></span><span class="line">    }</span><span class="line"></span><span class="line">    <span class="kw">if</span> (t &lt; d) O[i * d + t] = acc / l;            <span class="cmt">// final normalize</span></span><span class="line">}</span></code></pre>
+</div>
+
+<p>
+    Launch config (<code>flash_attention.cu:155</code>):
+    <strong>grid = M</strong> (one CTA per query),
+    <strong>block = nextPow2(d)</strong> (so the dot-product reduction is clean),
+    <strong>shared = (d + T) × 4 B</strong> (query cache + reduction scratch).
+    For <em>d = 64</em>, that's 64 threads/block and ~0.5 KB shmem/block.
+</p>
+
+<!-- ===================================================================== -->
+<h2>4. Following one CTA through the inner loop</h2>
+
+<p>
+    The key animation. Watch what happens for <em>one</em> CTA (query row <em>i</em>)
+    over a few key iterations. The interesting bit is what happens when a key
+    arrives with a <em>bigger score than anything seen before</em> — the
+    <code>corr</code> rescales every prior contribution in a single multiply.
+</p>
+
+<div class="figure" id="fig-flash">
+    <svg viewBox="0 0 720 440" preserveAspectRatio="xMidYMid meet">
+        <!-- Row 1: Q (in shared) + K/V streaming from DRAM -->
+        <text x="100" y="22" text-anchor="middle" class="svg-title">Q[i] in shared</text>
+        <text x="465" y="22" text-anchor="middle" class="svg-title">K, V streaming from DRAM</text>
+        <g id="fQ"  transform="translate(30,40)"></g>
+        <g id="fKV" transform="translate(220,40)"></g>
+
+        <!-- Row 2: Running scalars (now BELOW the K/V row, full width) -->
+        <text x="360" y="180" text-anchor="middle" class="svg-title">Running scalars (registers)</text>
+        <g transform="translate(20,195)">
+            <rect x="0"   y="0" width="220" height="36" rx="4" fill="#dafbe1" stroke="#1a7f37"/>
+            <text x="110" y="22" text-anchor="middle" class="svg-lbl" id="lblM">m   = −inf</text>
+        </g>
+        <g transform="translate(250,195)">
+            <rect x="0"   y="0" width="220" height="36" rx="4" fill="#dafbe1" stroke="#1a7f37"/>
+            <text x="110" y="22" text-anchor="middle" class="svg-lbl" id="lblL">l   = 0.000</text>
+        </g>
+        <g transform="translate(480,195)">
+            <rect x="0"   y="0" width="220" height="36" rx="4" fill="#dafbe1" stroke="#1a7f37"/>
+            <text x="110" y="22" text-anchor="middle" class="svg-lbl" id="lblA">acc = 0.000</text>
+        </g>
+
+        <!-- Row 3: This iteration -->
+        <text x="360" y="265" text-anchor="middle" class="svg-title">This iteration</text>
+        <text x="360" y="290" text-anchor="middle" class="svg-lbl" id="lblIter">j = — · s_j = —</text>
+        <text x="360" y="313" text-anchor="middle" class="svg-lbl" id="lblCorr">corr = exp(m_old − m_new) = —</text>
+        <text x="360" y="335" text-anchor="middle" class="svg-lbl" id="lblP"   >p    = exp(s_j   − m_new) = —</text>
+
+        <!-- Notes -->
+        <text x="360" y="390" text-anchor="middle" class="svg-dim" id="lblNote">no [M × N] scores buffer is ever allocated</text>
+        <text x="360" y="410" text-anchor="middle" class="svg-dim" id="lblNote2">register state size: 3 floats × (T threads) — independent of N</text>
+    </svg>
+    <div class="caption" id="fCap">Step through 5 key iterations and a final normalize. Watch how m, l, acc evolve.</div>
+    <div class="controls">
+        <button data-act="prev">◂ Prev</button>
+        <button data-act="step">Step ▸</button>
+        <button data-act="reset">↺ Reset</button>
+        <span class="tick-label">step 1 / 7</span>
+    </div>
+</div>
+
+<!-- ===================================================================== -->
+<h2>5. Memory comparison (this is the whole point)</h2>
+
+<table>
+<tr><th></th><th>Naive attention</th><th>Flash attention</th></tr>
+<tr><td>[M × N] scores buffer</td><td><strong>4 MB written, 4 MB read</strong> (for M=N=512)</td><td>0 — never exists</td></tr>
+<tr><td>Q reads</td><td>per element of scores (~N × per Q row)</td><td><strong>once per CTA</strong> (cached in shared)</td></tr>
+<tr><td>K reads</td><td>per element of scores → N × d per Q row</td><td>N × d per Q row (re-read each query)</td></tr>
+<tr><td>V reads</td><td>per element of output → M × N × d</td><td>M × N × d (same trade)</td></tr>
+<tr><td>Kernel launches</td><td>3</td><td>1</td></tr>
+<tr><td>Per-CTA extra state</td><td>—</td><td>O(d) registers</td></tr>
+</table>
+
+<div class="callout warn">
+    <strong>The trade.</strong> Flash attention re-reads K and V N times per
+    query — that's <em>more</em> DRAM traffic on those tensors compared to a
+    well-tiled naive attention. But it eliminates the [M × N] traffic entirely.
+    For long sequences (large N) the scores buffer wouldn't fit in cache anyway,
+    so removing it is a pure win. For tiny problems (this test case) the
+    naive version can actually be faster — the test harness comparison is
+    instructive.
+</div>
+
+<!-- ===================================================================== -->
+<h2>6. Optimizations the source <em>doesn't</em> include</h2>
+
+<p>
+    The simplified version in <code>flash_attention.cu</code> processes
+    <strong>one query row per CTA</strong> (Br = 1 in FlashAttention terms).
+    Production FlashAttention tiles Br queries together, which:
+</p>
+
+<ul>
+    <li>amortizes K/V reads across Br rows (huge: K is re-read N times instead
+        of N × M times)</li>
+    <li>uses tensor cores for the dot product (not applicable on TU116, but
+        that's what gets cited in benchmarks)</li>
+    <li>uses warp-level shuffles instead of <code>__syncthreads()</code>-heavy
+        block reductions</li>
+</ul>
+
+<p>
+    The version on the page is the cleanest possible introduction to the
+    online-softmax math; the production version is the same math wrapped in
+    progressively more optimization layers.
+</p>
+
+<!-- ===================================================================== -->
+<h2>7. Pitfalls</h2>
+
+<ul>
+    <li><strong>Forgetting to <code>__syncthreads()</code> at the end of each j-iteration</strong>
+        — the next iteration's <code>red[t] = ...</code> would race with threads
+        still reading <code>red[0]</code> for <code>s_j</code>. The source does
+        this at line 134.</li>
+    <li><strong>Using <code>exp()</code> instead of <code>__expf()</code></strong>
+        in the inner loop costs significant cycles. The fast intrinsic is
+        accurate enough (1 ulp) for softmax.</li>
+    <li><strong>Threads <code>t ≥ d</code></strong> are padding for the
+        reduction. They must contribute 0 (line 118 does this with the
+        ternary), but they still participate in the syncs and reductions.</li>
+    <li><strong>Choosing T:</strong> next-pow2-of-d, but if d &gt; 1024 the
+        kernel can't launch — block size is capped. Production FlashAttention
+        loops over the d dimension to handle bigger head sizes.</li>
+</ul>
+
+<footer>
+    That's the whole site — vector add to flash attention, all on the 1660 Super.
+    Every kernel here is a story about <em>where bytes live</em> and <em>which warp
+    moves them</em>.
+</footer>
+
+</main>
+
+<script>
+class StepFig {
+    constructor(figEl, ticks) {
+        this.fig = figEl; this.ticks = ticks; this.idx = 0;
+        this.cap = figEl.querySelector('.caption');
+        this.tickLabel = figEl.querySelector('.tick-label');
+        this.btnPrev  = figEl.querySelector('[data-act=prev]');
+        this.btnStep  = figEl.querySelector('[data-act=step]');
+        this.btnReset = figEl.querySelector('[data-act=reset]');
+        if (this.btnPrev)  this.btnPrev.addEventListener('click', () => this.prev());
+        if (this.btnStep)  this.btnStep.addEventListener('click', () => this.step());
+        if (this.btnReset) this.btnReset.addEventListener('click', () => this.reset());
+        this.render();
+    }
+    render() {
+        this.ticks[this.idx].apply();
+        if (this.cap) this.cap.textContent = this.ticks[this.idx].caption;
+        if (this.tickLabel) this.tickLabel.textContent = `step ${this.idx + 1} / ${this.ticks.length}`;
+        if (this.btnPrev) this.btnPrev.disabled = (this.idx === 0);
+        if (this.btnStep) this.btnStep.disabled = (this.idx === this.ticks.length - 1);
+    }
+    step()  { if (this.idx < this.ticks.length - 1) { this.idx++; this.render(); } }
+    prev()  { if (this.idx > 0) { this.idx--; this.render(); } }
+    reset() { this.idx = 0; this.render(); }
+}
+const NS = 'http://www.w3.org/2000/svg';
+function mk(tag, attrs = {}, parent = null) {
+    const el = document.createElementNS(NS, tag);
+    for (const k in attrs) el.setAttribute(k, attrs[k]);
+    if (parent) parent.appendChild(el);
+    return el;
+}
+
+// ===================================================================
+// Figure: flash-attention running state through 5 key iterations
+// ===================================================================
+(function () {
+    const fig = document.getElementById('fig-flash');
+    const Q = fig.querySelector('#fQ');
+    const KV = fig.querySelector('#fKV');
+    const lblM = fig.querySelector('#lblM');
+    const lblL = fig.querySelector('#lblL');
+    const lblA = fig.querySelector('#lblA');
+    const lblIter = fig.querySelector('#lblIter');
+    const lblCorr = fig.querySelector('#lblCorr');
+    const lblP    = fig.querySelector('#lblP');
+
+    // Q[i] = 4 cells in shared
+    for (let i = 0; i < 4; i++) {
+        mk('rect', { x: i*32, y: 0, width: 28, height: 32, rx: 3,
+            fill: '#fff8c5', stroke: '#9a6700' }, Q);
+        mk('text', { x: i*32 + 14, y: 22, 'text-anchor': 'middle', class: 'svg-lbl' }, Q)
+            .textContent = ['q0','q1','q2','q3'][i];
+    }
+
+    // K and V tiles streaming (TILE_GAP keeps 5 tiles inside the 720-wide viewBox)
+    const kCells = [], vCells = [];
+    const TILE_GAP = 96;
+    for (let j = 0; j < 5; j++) {
+        for (let e = 0; e < 4; e++) {
+            kCells.push(mk('rect', { x: e*22 + j*TILE_GAP, y: 0, width: 20, height: 26, rx: 2,
+                fill: '#ffebe9', stroke: '#cf222e' }, KV));
+        }
+        mk('text', { x: j*TILE_GAP + 40, y: 42, 'text-anchor': 'middle', class: 'svg-dim' }, KV)
+            .textContent = `K[${j}]`;
+        for (let e = 0; e < 4; e++) {
+            vCells.push(mk('rect', { x: e*22 + j*TILE_GAP, y: 60, width: 20, height: 26, rx: 2,
+                fill: '#ffebe9', stroke: '#cf222e' }, KV));
+        }
+        mk('text', { x: j*TILE_GAP + 40, y: 102, 'text-anchor': 'middle', class: 'svg-dim' }, KV)
+            .textContent = `V[${j}]`;
+    }
+    function highlightK(j) {
+        for (let jj = 0; jj < 5; jj++) {
+            const fill = (jj === j) ? '#7fd296' : '#ffebe9';
+            for (let e = 0; e < 4; e++) {
+                kCells[jj*4 + e].setAttribute('fill', fill);
+                vCells[jj*4 + e].setAttribute('fill', fill);
+            }
+        }
+    }
+    function setLabels(m, l, acc, iter, corr, p) {
+        lblM.textContent = `m   = ${m}`;
+        lblL.textContent = `l   = ${l}`;
+        lblA.textContent = `acc = ${acc}`;
+        lblIter.textContent = iter;
+        lblCorr.textContent = corr;
+        lblP.textContent    = p;
+    }
+
+    // Synthetic numbers chosen to show a max-jump on iteration j=3.
+    // scores s_j (arbitrary): [0.2, 0.5, 0.1, 1.4, 0.3]
+    // acc per-thread (one number for the figure), using V values of [0.5, 0.7, 0.4, 1.0, 0.6]
+    // We pre-compute the values rather than animating real floats.
+    const ticks = [
+        { caption: 'Initial state. Q[i] sits in shared. m=−inf, l=0, acc=0 in registers. K and V will stream in from DRAM.',
+          apply: () => { highlightK(-1);
+              setLabels('−inf', '0.000', '0.000',
+                  'j = — · s_j = —',
+                  'corr = exp(m_old − m_new) = —',
+                  'p    = exp(s_j   − m_new) = —'); } },
+        { caption: 'j = 0: read K[0] and V[0]. Score s_0 = 0.2. First key → m_new = 0.2, corr = 0 (irrelevant), p = 1.',
+          apply: () => { highlightK(0);
+              setLabels('0.200', '1.000', '0.500',
+                  'j = 0 · s_0 = 0.200',
+                  'corr = exp(−inf − 0.2) = 0  (first key)',
+                  'p    = exp(0.2 − 0.2) = 1.000'); } },
+        { caption: 'j = 1: s_1 = 0.5 > current m. m_new = 0.5. corr = exp(0.2 − 0.5) = 0.74. Rescale, then add p=1.',
+          apply: () => { highlightK(1);
+              setLabels('0.500', '1.741', '1.069',
+                  'j = 1 · s_1 = 0.500',
+                  'corr = exp(0.2 − 0.5) = 0.741',
+                  'p    = exp(0.5 − 0.5) = 1.000'); } },
+        { caption: 'j = 2: s_2 = 0.1 < m. m_new = 0.5 unchanged, corr = 1. Just append p = exp(0.1 − 0.5) = 0.67.',
+          apply: () => { highlightK(2);
+              setLabels('0.500', '2.411', '1.337',
+                  'j = 2 · s_2 = 0.100',
+                  'corr = exp(0.5 − 0.5) = 1.000',
+                  'p    = exp(0.1 − 0.5) = 0.670'); } },
+        { caption: 'j = 3: s_3 = 1.4. BIG jump. m_new = 1.4, corr = exp(0.5 − 1.4) = 0.41. Old state SHRINKS.',
+          apply: () => { highlightK(3);
+              setLabels('1.400', '1.988', '1.548',
+                  'j = 3 · s_3 = 1.400',
+                  'corr = exp(0.5 − 1.4) = 0.407',
+                  'p    = exp(1.4 − 1.4) = 1.000'); } },
+        { caption: 'j = 4: s_4 = 0.3. Small. m unchanged. Append p = exp(0.3 − 1.4) = 0.33.',
+          apply: () => { highlightK(4);
+              setLabels('1.400', '2.321', '1.747',
+                  'j = 4 · s_4 = 0.300',
+                  'corr = exp(1.4 − 1.4) = 1.000',
+                  'p    = exp(0.3 − 1.4) = 0.333'); } },
+        { caption: 'Done. After all keys, write O[i][t] = acc / l. No [M × N] buffer was ever needed.',
+          apply: () => { highlightK(-1);
+              setLabels('1.400 (final)', '2.321 (final)', '1.747 (final)',
+                  'output: O[i][t] = acc / l ≈ 0.753',
+                  'no scores matrix materialized',
+                  'register state: 3 floats × T threads — independent of N'); } },
+    ];
+    new StepFig(fig, ticks);
+})();
+</script>
+</body>
+</html>

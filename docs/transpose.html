@@ -1,0 +1,588 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Transpose — LeetGPU</title>
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+
+<nav class="topnav">
+    <span class="brand">leetgpu/</span>
+    <a href="index.html">index</a>
+    <a href="primer.html">primer</a>
+    <a href="transpose.html">transpose</a>
+    <span class="spacer"></span>
+    <span class="dim">target: GTX 1660 Super</span>
+</nav>
+
+<main>
+
+<h1>Matrix Transpose</h1>
+
+<div class="callout">
+    <strong>TL;DR.</strong> The naive transpose reads coalesced rows but writes
+    scattered columns, costing <strong>~32× the DRAM bandwidth it should</strong>.
+    The fix: stage a 32×32 tile in shared memory so <em>both</em> the read and the
+    write are coalesced. One subtlety — declare the tile as
+    <code>tile[32][33]</code>, not <code>tile[32][32]</code>, to dodge a 32-way
+    bank conflict.
+</div>
+
+<p class="small dim">
+    Source: <a href="../transpose.cu">/workspaces/leetgpu-master/transpose.cu</a>.
+    All line numbers below cite that file.
+</p>
+
+<div class="legend">
+    <span><span class="swatch" style="background:#ffebe9;border-color:#cf222e"></span>DRAM</span>
+    <span><span class="swatch" style="background:#fff1cf;border-color:#bf8700"></span>L2</span>
+    <span><span class="swatch" style="background:#fff8c5;border-color:#9a6700"></span>L1 / shared</span>
+    <span><span class="swatch" style="background:#dafbe1;border-color:#1a7f37"></span>register</span>
+    <span><span class="swatch" style="background:#fbefff;border-color:#8250df"></span>warp</span>
+</div>
+
+<!-- ===================================================================== -->
+<h2>1. The problem</h2>
+
+<p>
+    Given an <em>R×C</em> matrix <code>A</code>, produce its transpose <code>A<sup>T</sup></code>
+    of size <em>C×R</em>: element <code>(i, j)</code> of the input becomes element
+    <code>(j, i)</code> of the output. In row-major memory:
+</p>
+
+<pre><code>output[col * rows + row] = input[row * cols + col];</code></pre>
+
+<p>
+    No arithmetic at all — every byte read becomes a byte written.
+    This is the cleanest possible <strong>memory-bound</strong> kernel: there is
+    nothing to optimize except memory bandwidth.
+</p>
+
+<div class="callout">
+    <strong>Bandwidth ceiling.</strong> For a 1024×1024 float matrix we move
+    2 × 1024 × 1024 × 4 B = <strong>8 MB</strong> of data. At 336 GB/s we can do
+    that in ≈ 24 μs. Any slower means we're wasting bandwidth — the only thing
+    that matters.
+</div>
+
+<!-- ===================================================================== -->
+<h2>2. Launch configuration</h2>
+
+<p>
+    Both kernels use the same launch (<code>transpose.cu:60–63</code>):
+</p>
+
+<div class="code-block">
+<pre data-start-line="59" style="--start-line: 59;"><code><span class="line"><span class="ty">dim3</span> blockSize(TILE_SIZE, TILE_SIZE);             <span class="cmt">// 32 × 32 = 1024 threads / CTA</span></span><span class="line"><span class="cmt">// rows = 96, cols = 256</span></span><span class="line"><span class="cmt">// gridSize = (8, 3)</span></span><span class="line"><span class="ty">dim3</span> gridSize(cdiv(cols, TILE_SIZE), cdiv(rows, TILE_SIZE));</span></code></pre>
+</div>
+
+<p>
+    For a 1024×1024 input that's a <strong>32 × 32 grid</strong> of <strong>32 × 32</strong>
+    blocks — 1024 CTAs, 1024 threads each, 1,048,576 threads total. The 1660 Super
+    has 22 SMs, so multiple CTAs co-reside per SM and the GPU keeps thousands of
+    warps in flight.
+</p>
+
+<div class="figure">
+    <svg viewBox="0 0 720 240" preserveAspectRatio="xMidYMid meet">
+        <text x="180" y="22" text-anchor="middle" class="svg-title">Grid: 32 × 32 CTAs</text>
+        <text x="540" y="22" text-anchor="middle" class="svg-title">One CTA: 32 × 32 threads</text>
+        <g id="gridMini"></g>
+        <g id="ctaExpand"></g>
+        <path d="M 330 130 L 380 130" stroke="#0969da" stroke-width="2" fill="none" marker-end="url(#arr1)" />
+        <defs>
+            <marker id="arr1" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+                <path d="M0,0 L0,6 L9,3 z" fill="#0969da"/>
+            </marker>
+        </defs>
+        <text x="355" y="120" text-anchor="middle" class="svg-dim">zoom</text>
+    </svg>
+    <div class="caption">Each CTA processes one 32×32 tile of the output. (Schematic — diagram shows 8×8 grid and 8×8 block for legibility.)</div>
+</div>
+
+<!-- ===================================================================== -->
+<h2>3. The naive kernel — why it's slow</h2>
+
+<p>The implementation is two lines of memory work (<code>transpose.cu:22–30</code>):</p>
+
+<div class="code-block">
+<pre data-start-line="21" style="--start-line: 21;"><code><span class="line"><span class="kw">__global__</span> <span class="ty">void</span> <span class="fn">transposeNaive</span>(<span class="kw">const</span> <span class="ty">float</span>* input, <span class="ty">float</span>* output, <span class="ty">int</span> rows, <span class="ty">int</span> cols) {</span><span class="line">    <span class="cmt">// Simple approach - may have coalescing issues</span></span><span class="line">    <span class="ty">int</span> row = blockIdx.y * blockDim.y + threadIdx.y;</span><span class="line">    <span class="ty">int</span> col = blockIdx.x * blockDim.x + threadIdx.x;</span><span class="line"></span><span class="line">    <span class="kw">if</span> (row &lt; rows &amp;&amp; col &lt; cols) {</span><span class="line">        output[col * rows + row] = input[row * cols + col];   <span class="cmt">// the whole kernel</span></span><span class="line">    }</span><span class="line">}</span></code></pre>
+</div>
+
+<p>
+    A warp here is <em>one row of the 32×32 block</em>: 32 threads with the
+    same <code>threadIdx.y</code> and consecutive <code>threadIdx.x</code>.
+    Look at what they touch:
+</p>
+
+<ul>
+    <li><strong>Read:</strong> thread <code>i</code> reads <code>input[row*cols + col<sub>i</sub>]</code>.
+        Consecutive threads → consecutive columns → consecutive addresses.
+        <span style="color:var(--good);">Coalesced. One DRAM transaction.</span></li>
+    <li><strong>Write:</strong> thread <code>i</code> writes <code>output[col<sub>i</sub>*rows + row]</code>.
+        Consecutive <code>col<sub>i</sub></code> means addresses jump by <em>rows</em> bytes (= 4096 B for 1024×1024).
+        <span style="color:var(--bad);">Scattered. Up to 32 separate transactions.</span></li>
+</ul>
+
+<div class="figure" id="fig-naive">
+    <svg viewBox="0 0 720 380" preserveAspectRatio="xMidYMid meet">
+        <text x="160" y="22" text-anchor="middle" class="svg-title">Input matrix in DRAM</text>
+        <text x="560" y="22" text-anchor="middle" class="svg-title">Output matrix in DRAM</text>
+
+        <g id="naiveIn"  transform="translate(60,40)"></g>
+        <g id="naiveOut" transform="translate(440,40)"></g>
+
+        <rect id="warpRow" x="58" y="38" width="244" height="32" rx="4"
+              fill="none" stroke="#8250df" stroke-width="3" opacity="0"/>
+
+        <g id="readArrow" opacity="0">
+            <rect x="60" y="270" width="244" height="14" rx="4" fill="#cce5ff" stroke="#0969da" />
+            <text x="182" y="305" text-anchor="middle" class="svg-lbl" fill="#1a7f37">1 read transaction — coalesced</text>
+        </g>
+
+        <g id="writeArrows" opacity="1"></g>
+        <text id="writeLabel" x="560" y="335" text-anchor="middle" class="svg-lbl" fill="#cf222e" opacity="0">8 write transactions — scattered column</text>
+    </svg>
+    <div class="caption" id="cap-naive">One warp does one fat read and a fan of scattered writes.</div>
+    <div class="controls">
+        <button data-act="prev">◂ Prev</button>
+        <button data-act="step">Step ▸</button>
+        <button data-act="reset">↺ Reset</button>
+        <span class="tick-label">step 1 / 5</span>
+    </div>
+</div>
+
+<div class="callout bad">
+    For a 1024×1024 transpose, the naive kernel moves <strong>roughly 32× more bytes
+    than it had to</strong> on the write side. Measured bandwidth lands far below
+    the 336 GB/s ceiling — typically 30–60 GB/s on this card.
+</div>
+
+<!-- ===================================================================== -->
+<h2>4. The shared-memory kernel</h2>
+
+<p>
+    Trick: don't write to DRAM in column order. Instead, <em>park a whole 32×32
+    tile in shared memory first</em>, then write it back to DRAM in row order.
+    Both DRAM trips are now coalesced — DRAM never sees a strided access.
+</p>
+
+<div class="code-block">
+<pre data-start-line="32" style="--start-line: 32;"><code><span class="line"><span class="kw">__global__</span> <span class="ty">void</span> <span class="fn">transposeShared</span>(<span class="kw">const</span> <span class="ty">float</span>* input, <span class="ty">float</span>* output, <span class="ty">int</span> rows, <span class="ty">int</span> cols) {</span><span class="line">    <span class="kw">__shared__</span> <span class="ty">float</span> tile[(TILE_SIZE + 1) * TILE_SIZE];   <span class="cmt">// ← +1 = bank-conflict trick</span></span><span class="line">    <span class="ty">int</span> row = blockIdx.y * blockDim.y + threadIdx.y;</span><span class="line">    <span class="ty">int</span> col = blockIdx.x * blockDim.x + threadIdx.x;</span><span class="line"></span><span class="line">    <span class="kw">if</span> (row &lt; rows &amp;&amp; col &lt; cols)</span><span class="line">        tile[threadIdx.y * (TILE_SIZE + 1) + threadIdx.x] = input[row * cols + col];   <span class="cmt">// coalesced read</span></span><span class="line">    <span class="fn">__syncthreads</span>();   <span class="cmt">// wait for every thread in the CTA</span></span><span class="line"></span><span class="line">    <span class="ty">int</span> outrow = blockIdx.x * blockDim.x + threadIdx.y;</span><span class="line">    <span class="ty">int</span> outcol = blockIdx.y * blockDim.y + threadIdx.x;</span><span class="line">    <span class="kw">if</span> (outrow &lt; cols &amp;&amp; outcol &lt; rows) {</span><span class="line">        <span class="ty">float</span> out = tile[threadIdx.x * (TILE_SIZE + 1) + threadIdx.y];   <span class="cmt">// transposed read from shared</span></span><span class="line">        output[outrow * rows + outcol] = out;   <span class="cmt">// coalesced write</span></span><span class="line">    }</span><span class="line">}</span></code></pre>
+</div>
+
+<p>What happened in each step:</p>
+
+<ol>
+    <li><strong>Coalesced load</strong> from DRAM into the shared tile.
+        Thread <code>(tx, ty)</code> stores at <code>tile[ty][tx]</code>.
+        Within a warp <code>ty</code> is fixed and <code>tx</code> spans 0..31 —
+        consecutive shared addresses, no conflict.</li>
+    <li><strong><code>__syncthreads()</code></strong> — every thread in the CTA waits here.
+        After this point, the entire 32×32 tile is sitting in SRAM.</li>
+    <li><strong>Transposed read from shared.</strong> Now thread <code>(tx, ty)</code>
+        reads <code>tile[tx][ty]</code>. Within a warp <code>ty</code> is fixed and
+        <code>tx</code> spans 0..31 — that's a <em>column</em> of the shared tile.
+        Bank conflict alert! → see §5.</li>
+    <li><strong>Coalesced store</strong> back to DRAM. <code>outrow</code> is fixed
+        per warp, <code>outcol</code> spans 0..31 — consecutive DRAM addresses.</li>
+</ol>
+
+<div class="figure" id="fig-shared">
+    <svg viewBox="0 0 720 380" preserveAspectRatio="xMidYMid meet">
+        <text x="120" y="22" text-anchor="middle" class="svg-title">Input (DRAM)</text>
+        <text x="360" y="22" text-anchor="middle" class="svg-title">Tile (shared / SRAM)</text>
+        <text x="600" y="22" text-anchor="middle" class="svg-title">Output (DRAM)</text>
+
+        <g id="sIn"   transform="translate(40,40)"></g>
+        <g id="sTile" transform="translate(280,40)"></g>
+        <g id="sOut"  transform="translate(520,40)"></g>
+
+        <g id="sP1" opacity="0">
+            <path d="M 200 130 Q 240 110 280 130" stroke="#1a7f37" stroke-width="3" fill="none" marker-end="url(#sArrG)"/>
+            <text x="240" y="100" text-anchor="middle" class="svg-lbl" fill="#1a7f37">coalesced row read → shared row</text>
+        </g>
+
+        <g id="sSync" opacity="0">
+            <rect x="280" y="40" width="200" height="200" rx="6" fill="none" stroke="#0969da" stroke-width="3" stroke-dasharray="6 4"/>
+            <text x="380" y="262" text-anchor="middle" class="svg-lbl" fill="#0969da">__syncthreads() — barrier</text>
+        </g>
+
+        <g id="sP3" opacity="0">
+            <path d="M 480 140 Q 510 120 520 140" stroke="#8250df" stroke-width="3" fill="none" marker-end="url(#sArrP)"/>
+            <text x="500" y="105" text-anchor="middle" class="svg-lbl" fill="#8250df">transposed read from shared</text>
+        </g>
+
+        <g id="sP4" opacity="0">
+            <rect x="520" y="270" width="200" height="14" rx="4" fill="#cce5ff" stroke="#0969da"/>
+            <text x="620" y="305" text-anchor="middle" class="svg-lbl" fill="#1a7f37">coalesced write to DRAM</text>
+        </g>
+
+        <defs>
+            <marker id="sArrG" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+                <path d="M0,0 L0,6 L9,3 z" fill="#1a7f37"/>
+            </marker>
+            <marker id="sArrP" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+                <path d="M0,0 L0,6 L9,3 z" fill="#8250df"/>
+            </marker>
+        </defs>
+    </svg>
+    <div class="caption" id="cap-shared">Both DRAM trips are coalesced. The "weird" access becomes a fast SRAM op instead.</div>
+    <div class="controls">
+        <button data-act="prev">◂ Prev</button>
+        <button data-act="step">Step ▸</button>
+        <button data-act="reset">↺ Reset</button>
+        <span class="tick-label">step 1 / 6</span>
+    </div>
+</div>
+
+<!-- ===================================================================== -->
+<h2>5. Bank conflicts and the <code>+1</code> trick</h2>
+
+<p>
+    Shared memory is split into 32 banks, each 4 bytes wide. Word at offset
+    <code>k</code> lives in bank <code>k % 32</code>.
+</p>
+
+<p>
+    If we declared the tile as a plain <code>tile[32][32]</code>, then a column read
+    — thread <em>i</em> reads <code>tile[i][fixed_col]</code> — touches addresses
+    <code>i*32 + fixed_col</code>. Those <strong>all share the same bank index</strong>.
+    A 32-way conflict. The hardware serializes all 32 reads.
+</p>
+
+<p>
+    By declaring the tile <code>(TILE_SIZE + 1)</code> wide instead, the row stride
+    becomes 33 (= 32 + 1). Now bank index for a column read is <code>(i*33 + c) % 32 = (i + c) % 32</code>
+    — each thread hits a different bank. Conflict-free, single-cycle.
+</p>
+
+<div class="figure" id="fig-banks2">
+    <svg viewBox="0 0 720 360" preserveAspectRatio="xMidYMid meet">
+        <text x="360" y="22" text-anchor="middle" class="svg-title" id="bk2Title">Column read of an unpadded 8×8 tile</text>
+
+        <text x="40" y="48" class="svg-dim">threads</text>
+        <g id="bk2Threads" transform="translate(40,55)"></g>
+
+        <g id="bk2Arrows" transform="translate(0,110)"></g>
+
+        <text x="40" y="203" class="svg-dim">banks</text>
+        <g id="bk2Banks" transform="translate(40,210)"></g>
+
+        <text x="360" y="290" text-anchor="middle" class="svg-dim" id="bk2Caption">all 8 column reads land on bank 0 → 8-way serialization</text>
+        <text x="360" y="310" text-anchor="middle" class="svg-dim" id="bk2Cycles">cost: 8 cycles</text>
+    </svg>
+    <div class="caption" id="cap-bk2">Step through the two layouts. Same kernel, one character difference, 8× slowdown.</div>
+    <div class="controls">
+        <button data-act="prev">◂ Prev</button>
+        <button data-act="step">Step ▸</button>
+        <button data-act="reset">↺ Reset</button>
+        <span class="tick-label">step 1 / 3</span>
+    </div>
+</div>
+
+<div class="callout good">
+    Memorize this pattern. <strong>Any time you transpose data through shared
+    memory, the tile gets one extra column.</strong> Costs a few hundred bytes,
+    earns you a full 32× shared-memory throughput.
+</div>
+
+<!-- ===================================================================== -->
+<h2>6. Memory-hierarchy story (where bytes live, when)</h2>
+
+<table>
+<tr><th>Step</th><th>Where bytes live</th><th>Coalesced?</th><th>Latency hit</th></tr>
+<tr><td>Read input</td><td>DRAM → L2 → L1 → register</td><td><span style="color:var(--good);">yes (row)</span></td><td>~500 cyc (hidden by other warps)</td></tr>
+<tr><td>Write to tile</td><td>register → shared (SRAM)</td><td>—</td><td>~1 cyc</td></tr>
+<tr><td><code>__syncthreads()</code></td><td>—</td><td>—</td><td>fast (single CTA)</td></tr>
+<tr><td>Read tile (transposed)</td><td>shared → register</td><td>—</td><td>1 cyc <em>iff no bank conflict</em></td></tr>
+<tr><td>Write output</td><td>register → L2 → DRAM</td><td><span style="color:var(--good);">yes (row)</span></td><td>~500 cyc (hidden)</td></tr>
+</table>
+
+<p>
+    Compare to the naive kernel which skips the middle three rows entirely and pays
+    the DRAM cost <em>twice</em> instead, with the second trip uncoalesced.
+</p>
+
+<!-- ===================================================================== -->
+<h2>7. Why the shared-memory version is fast</h2>
+
+<ul>
+    <li><strong>DRAM is touched in row order both ways.</strong> Every warp's DRAM
+        load and store coalesces into one 128-byte transaction.</li>
+    <li><strong>The transposed access pattern moves to shared memory</strong> —
+        which can serve any access pattern in 1 cycle, as long as banks don't collide.</li>
+    <li><strong>The <code>+1</code> padding</strong> dodges the only remaining
+        bank-conflict landmine.</li>
+    <li><strong>Latency hiding:</strong> 1024 threads/CTA × many CTAs/SM keeps
+        dozens of warps in flight per SM. When one warp is waiting on DRAM,
+        another is ready.</li>
+</ul>
+
+<!-- ===================================================================== -->
+<h2>8. Pitfalls and gotchas</h2>
+
+<ul>
+    <li><strong>Forgetting <code>__syncthreads()</code></strong> →
+        reads from the tile before all writes have landed. Random garbage output.</li>
+    <li><strong>Putting <code>__syncthreads()</code> inside an <code>if</code>
+        that's not uniform across the CTA</strong> → undefined behavior, possible
+        deadlock.</li>
+    <li><strong>Rectangular tiles (e.g. 32×16):</strong> the bank-conflict math changes —
+        the safe <code>+1</code> trick still works because gcd(stride, 32) shifts banks.</li>
+    <li><strong>Non-multiple sizes:</strong> the boundary <code>if</code>s in the
+        kernel handle ragged edges, but you still launch full warps for the
+        partial blocks — some lanes are idle.</li>
+</ul>
+
+<footer>
+    Source: <code>transpose.cu</code> in this repo. Next kernel will be
+    <em>vector_addition</em> — the simplest possible kernel, used to nail down
+    the warp execution model.
+</footer>
+
+</main>
+
+<!-- ===================================================================== -->
+<!-- Step-by-step figure controller — same as primer.html                    -->
+<!-- ===================================================================== -->
+<script>
+class StepFig {
+    constructor(figEl, ticks) {
+        this.fig = figEl; this.ticks = ticks; this.idx = 0;
+        this.cap = figEl.querySelector('.caption');
+        this.tickLabel = figEl.querySelector('.tick-label');
+        this.btnPrev  = figEl.querySelector('[data-act=prev]');
+        this.btnStep  = figEl.querySelector('[data-act=step]');
+        this.btnReset = figEl.querySelector('[data-act=reset]');
+        if (this.btnPrev)  this.btnPrev.addEventListener('click', () => this.prev());
+        if (this.btnStep)  this.btnStep.addEventListener('click', () => this.step());
+        if (this.btnReset) this.btnReset.addEventListener('click', () => this.reset());
+        this.render();
+    }
+    render() {
+        this.ticks[this.idx].apply();
+        if (this.cap) this.cap.textContent = this.ticks[this.idx].caption;
+        if (this.tickLabel) this.tickLabel.textContent = `step ${this.idx + 1} / ${this.ticks.length}`;
+        if (this.btnPrev) this.btnPrev.disabled = (this.idx === 0);
+        if (this.btnStep) this.btnStep.disabled = (this.idx === this.ticks.length - 1);
+    }
+    step()  { if (this.idx < this.ticks.length - 1) { this.idx++; this.render(); } }
+    prev()  { if (this.idx > 0) { this.idx--; this.render(); } }
+    reset() { this.idx = 0; this.render(); }
+}
+
+const NS = 'http://www.w3.org/2000/svg';
+function mk(tag, attrs = {}, parent = null) {
+    const el = document.createElementNS(NS, tag);
+    for (const k in attrs) el.setAttribute(k, attrs[k]);
+    if (parent) parent.appendChild(el);
+    return el;
+}
+
+// ---------- launch-config schematic (static) ----------
+(function () {
+    const mini = document.getElementById('gridMini');
+    if (mini) {
+        for (let r = 0; r < 8; r++) for (let c = 0; c < 8; c++)
+            mk('rect', { x: 40 + c * 30, y: 40 + r * 22, width: 26, height: 18, rx: 2,
+                fill: '#fbefff', stroke: '#8250df' }, mini);
+    }
+    const expand = document.getElementById('ctaExpand');
+    if (expand) {
+        for (let r = 0; r < 8; r++) for (let c = 0; c < 8; c++)
+            mk('rect', { x: 400 + c * 22, y: 40 + r * 18, width: 18, height: 14, rx: 2,
+                fill: '#dafbe1', stroke: '#1a7f37' }, expand);
+    }
+})();
+
+// ===================================================================
+// Figure A: naive transpose memory pattern
+// ===================================================================
+(function () {
+    const fig = document.getElementById('fig-naive');
+    const N = 8;
+    const cw = 30, ch = 22;
+    const inG  = fig.querySelector('#naiveIn');
+    const outG = fig.querySelector('#naiveOut');
+    const warpRow = fig.querySelector('#warpRow');
+    const readArrow = fig.querySelector('#readArrow');
+    const writeArrows = fig.querySelector('#writeArrows');
+    const writeLabel = fig.querySelector('#writeLabel');
+
+    const inCells = [], outCells = [];
+    for (let r = 0; r < N; r++) for (let c = 0; c < N; c++) {
+        inCells.push(mk('rect', { x: c*cw, y: r*ch, width: cw-2, height: ch-2, rx: 2,
+            fill: '#ffebe9', stroke: '#cf222e' }, inG));
+        outCells.push(mk('rect', { x: c*cw, y: r*ch, width: cw-2, height: ch-2, rx: 2,
+            fill: '#ffebe9', stroke: '#cf222e' }, outG));
+    }
+
+    // 8 write arrows fanning out: each thread writes to row r=i col 0 of output
+    const writeArrEls = [];
+    for (let i = 0; i < N; i++) {
+        const fromX = 60 + i * cw + cw/2;
+        const fromY = 60;
+        const toX   = 440 + 0 * cw + cw/2;
+        const toY   = 40 + i * ch + ch/2;
+        const path = `M ${fromX} ${fromY} C ${fromX} ${fromY + 80}, ${toX} ${toY - 80}, ${toX} ${toY}`;
+        writeArrEls.push(mk('path', { d: path, stroke: '#cf222e', 'stroke-width': 1.5,
+            fill: 'none', opacity: 0 }, writeArrows));
+    }
+
+    function setState(s) {
+        warpRow.setAttribute('opacity', s.warpRow);
+        readArrow.setAttribute('opacity', s.readArrow);
+        writeArrEls.forEach(a => a.setAttribute('opacity', s.writeArrows));
+        writeLabel.setAttribute('opacity', s.writeLabel);
+        // input row 0 highlight
+        for (let c = 0; c < N; c++) inCells[c].setAttribute('fill', s.inHi);
+        // output column 0 highlight
+        for (let r = 0; r < N; r++) outCells[r * N + 0].setAttribute('fill', s.outHi);
+    }
+    const DEFRED = '#ffebe9';
+    const ticks = [
+        { caption: 'Input and output matrices in DRAM. A warp = 8 threads (here) processing one row of the tile.',
+          apply: () => setState({ warpRow:0, readArrow:0, writeArrows:0, writeLabel:0, inHi:DEFRED, outHi:DEFRED }) },
+        { caption: 'Warp highlighted on row 0 of the input. 8 threads will read 8 consecutive cells.',
+          apply: () => setState({ warpRow:1, readArrow:0, writeArrows:0, writeLabel:0, inHi:'#b6e3c4', outHi:DEFRED }) },
+        { caption: 'Reads merge into ONE coalesced DRAM transaction. So far, so good.',
+          apply: () => setState({ warpRow:1, readArrow:1, writeArrows:0, writeLabel:0, inHi:'#7fd296', outHi:DEFRED }) },
+        { caption: 'Now the writes. Each thread writes to a different ROW of the output — spread across DRAM.',
+          apply: () => setState({ warpRow:1, readArrow:1, writeArrows:0.85, writeLabel:0, inHi:'#7fd296', outHi:'#ffcec4' }) },
+        { caption: 'These 8 writes cannot coalesce. Up to 8 separate DRAM transactions for the SAME payload.',
+          apply: () => setState({ warpRow:1, readArrow:1, writeArrows:1, writeLabel:1, inHi:'#7fd296', outHi:'#ff8a80' }) },
+    ];
+    new StepFig(fig, ticks);
+})();
+
+// ===================================================================
+// Figure B: shared-memory transpose flow
+// ===================================================================
+(function () {
+    const fig = document.getElementById('fig-shared');
+    const N = 8;
+    const cw = 22, ch = 22;
+    const inG = fig.querySelector('#sIn');
+    const tG  = fig.querySelector('#sTile');
+    const oG  = fig.querySelector('#sOut');
+    const inCells = [], tCells = [], oCells = [];
+    for (let r = 0; r < N; r++) for (let c = 0; c < N; c++) {
+        inCells.push(mk('rect', { x: c*cw, y: r*ch, width: cw-2, height: ch-2, rx: 2,
+            fill: '#ffebe9', stroke: '#cf222e' }, inG));
+        tCells.push(mk('rect',  { x: c*cw, y: r*ch, width: cw-2, height: ch-2, rx: 2,
+            fill: '#fff8c5', stroke: '#9a6700' }, tG));
+        oCells.push(mk('rect',  { x: c*cw, y: r*ch, width: cw-2, height: ch-2, rx: 2,
+            fill: '#ffebe9', stroke: '#cf222e' }, oG));
+    }
+    const sP1 = fig.querySelector('#sP1');
+    const sSync = fig.querySelector('#sSync');
+    const sP3 = fig.querySelector('#sP3');
+    const sP4 = fig.querySelector('#sP4');
+
+    function paint(cells, fn) {
+        // fn(r,c) returns fill string or null (= default)
+        for (let r = 0; r < N; r++) for (let c = 0; c < N; c++) {
+            const f = fn(r, c);
+            const def = cells === tCells ? '#fff8c5' : '#ffebe9';
+            cells[r*N + c].setAttribute('fill', f || def);
+        }
+    }
+    function setState(s) {
+        sP1.setAttribute('opacity', s.p1);
+        sSync.setAttribute('opacity', s.sync);
+        sP3.setAttribute('opacity', s.p3);
+        sP4.setAttribute('opacity', s.p4);
+        paint(inCells, s.fIn);
+        paint(tCells,  s.fT);
+        paint(oCells,  s.fO);
+    }
+    const def    = (r,c) => null;
+    const inRow0 = (r,c) => r === 0 ? '#7fd296' : null;
+    const allInGreenSoft = (r,c) => '#b6e3c4';
+    const tRow0   = (r,c) => r === 0 ? '#7fd296' : null;
+    const tAll    = (r,c) => '#e6d76e';
+    const tCol0   = (r,c) => c === 0 ? '#c8a2ff' : '#e6d76e';
+    const oRow0   = (r,c) => r === 0 ? '#c8a2ff' : null;
+    const oRow0Green = (r,c) => r === 0 ? '#7fd296' : null;
+
+    const ticks = [
+        { caption: 'Initial state. Input in DRAM (red). Empty 8×8 tile in shared SRAM (yellow). Empty output (red).',
+          apply: () => setState({ p1:0, sync:0, p3:0, p4:0, fIn:def, fT:def, fO:def }) },
+        { caption: 'Phase 1 — each warp reads a row of input (coalesced) into the SAME row of the tile.',
+          apply: () => setState({ p1:1, sync:0, p3:0, p4:0, fIn:inRow0, fT:tRow0, fO:def }) },
+        { caption: 'After all 8 warps run, the entire input tile is staged in shared memory.',
+          apply: () => setState({ p1:0, sync:0, p3:0, p4:0, fIn:allInGreenSoft, fT:tAll, fO:def }) },
+        { caption: '__syncthreads() — every thread waits until the tile is fully populated.',
+          apply: () => setState({ p1:0, sync:1, p3:0, p4:0, fIn:allInGreenSoft, fT:tAll, fO:def }) },
+        { caption: 'Phase 3 — each warp reads a COLUMN of the tile (from fast shared memory). The "+1" padding keeps this conflict-free.',
+          apply: () => setState({ p1:0, sync:0, p3:1, p4:0, fIn:allInGreenSoft, fT:tCol0, fO:oRow0 }) },
+        { caption: 'Phase 4 — that column gets written as a ROW to DRAM. Coalesced again. Both DRAM trips are clean.',
+          apply: () => setState({ p1:0, sync:0, p3:1, p4:1, fIn:allInGreenSoft, fT:tCol0, fO:oRow0Green }) },
+    ];
+    new StepFig(fig, ticks);
+})();
+
+// ===================================================================
+// Figure C: bank conflict (with/without padding)
+// ===================================================================
+(function () {
+    const fig = document.getElementById('fig-banks2');
+    const N = 8;
+    const threadsG = fig.querySelector('#bk2Threads');
+    const banksG   = fig.querySelector('#bk2Banks');
+    const arrowsG  = fig.querySelector('#bk2Arrows');
+    const title    = fig.querySelector('#bk2Title');
+    const cap      = fig.querySelector('#bk2Caption');
+    const cycles   = fig.querySelector('#bk2Cycles');
+
+    for (let i = 0; i < N; i++) {
+        mk('rect', { x: i*70, y: 0, width: 60, height: 30, rx: 3,
+            fill: '#dafbe1', stroke: '#1a7f37' }, threadsG);
+        mk('text', { x: i*70 + 30, y: 19, 'text-anchor': 'middle', class: 'svg-lbl' }, threadsG)
+            .textContent = 't' + i;
+        mk('rect', { x: i*70, y: 0, width: 60, height: 30, rx: 3,
+            fill: '#fff8c5', stroke: '#9a6700' }, banksG);
+        mk('text', { x: i*70 + 30, y: 19, 'text-anchor': 'middle', class: 'svg-lbl' }, banksG)
+            .textContent = 'b' + i;
+    }
+    const arrows = [];
+    for (let i = 0; i < N; i++)
+        arrows.push(mk('line', { stroke: '#1a7f37', 'stroke-width': 2 }, arrowsG));
+
+    function setArrows(targets, color) {
+        arrows.forEach((a, i) => {
+            const x1 = 40 + i * 70 + 30;
+            const x2 = 40 + targets[i] * 70 + 30;
+            a.setAttribute('x1', x1); a.setAttribute('y1', 30);
+            a.setAttribute('x2', x2); a.setAttribute('y2', 100);
+            a.setAttribute('stroke', color);
+        });
+    }
+    const ident   = [0,1,2,3,4,5,6,7];
+    const allZero = [0,0,0,0,0,0,0,0];
+
+    const ticks = [
+        { caption: 'Unpadded layout: row stride = 8. Column read → every thread hits bank 0. Worst case.',
+          apply: () => { title.textContent = '1) Unpadded tile[8][8] — column read';
+                         setArrows(allZero, '#cf222e');
+                         cap.textContent  = 'all 8 threads land on bank 0 → 8-way conflict';
+                         cycles.textContent = 'cost: 8 cycles (serialized)'; } },
+        { caption: 'Switch to tile[8][9]. Row stride = 9. Column read banks = (i·9 + 0) % 8 = i. All distinct.',
+          apply: () => { title.textContent = '2) Padded tile[8][9] — same column read';
+                         setArrows(ident, '#1a7f37');
+                         cap.textContent  = 'banks 0–7 all hit once → conflict-free';
+                         cycles.textContent = 'cost: 1 cycle'; } },
+        { caption: 'For the real 32-wide warps the math is identical: stride 33 instead of 32 → row bank-shift of 1.',
+          apply: () => { title.textContent = 'Same trick at warp scale: stride 33 vs 32';
+                         setArrows(ident, '#1a7f37');
+                         cap.textContent  = '32 banks, stride 33 → every column read hits 32 distinct banks';
+                         cycles.textContent = 'cost: 1 cycle (vs 32 unpadded)'; } },
+    ];
+    new StepFig(fig, ticks);
+})();
+</script>
+</body>
+</html>

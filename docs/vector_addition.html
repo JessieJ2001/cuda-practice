@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Vector Addition — LeetGPU</title>
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+
+<nav class="topnav">
+    <span class="brand">leetgpu/</span>
+    <a href="index.html">index</a>
+    <a href="primer.html">primer</a>
+    <a href="transpose.html">transpose</a>
+    <a href="vector_addition.html">vector_addition</a>
+    <span class="spacer"></span>
+    <span class="dim">target: GTX 1660 Super</span>
+</nav>
+
+<main>
+
+<h1>Vector Addition</h1>
+
+<div class="callout">
+    <strong>TL;DR.</strong> <code>C[i] = A[i] + B[i]</code> for every <code>i</code>.
+    The simplest possible CUDA kernel. We use it to nail down the warp execution
+    model and what <em>perfect</em> coalescing looks like — every kernel after this
+    is a deviation from this baseline.
+</div>
+
+<p class="small dim">
+    Source: <a href="../vector_addition.cu">/workspaces/leetgpu-master/vector_addition.cu</a>.
+</p>
+
+<div class="legend">
+    <span><span class="swatch" style="background:#ffebe9;border-color:#cf222e"></span>DRAM</span>
+    <span><span class="swatch" style="background:#fff1cf;border-color:#bf8700"></span>L2</span>
+    <span><span class="swatch" style="background:#fff8c5;border-color:#9a6700"></span>L1 / shared</span>
+    <span><span class="swatch" style="background:#dafbe1;border-color:#1a7f37"></span>register</span>
+    <span><span class="swatch" style="background:#fbefff;border-color:#8250df"></span>warp</span>
+</div>
+
+<!-- ===================================================================== -->
+<h2>1. The problem</h2>
+
+<p>
+    Given two vectors <code>A</code> and <code>B</code> of length <em>N</em>,
+    compute <code>C[i] = A[i] + B[i]</code>. The CPU version is one for-loop;
+    the GPU version is the same loop but every iteration runs in parallel.
+</p>
+
+<pre><code>// CPU                              // GPU
+for (int i = 0; i &lt; N; i++)         every thread does
+    C[i] = A[i] + B[i];                C[idx] = A[idx] + B[idx];
+                                       (with idx = its global thread index)</code></pre>
+
+<!-- ===================================================================== -->
+<h2>2. Launch configuration</h2>
+
+<p>1D grid, 1D block. From <code>vector_addition.cu:38–39</code>:</p>
+
+<div class="code-block">
+<pre data-start-line="37" style="--start-line: 37;"><code><span class="line"><span class="ty">int</span> threadsPerBlock = 1024;</span><span class="line"><span class="ty">int</span> blocksPerGrid = (N + threadsPerBlock - 1) / threadsPerBlock;   <span class="cmt">// ceil(N/1024)</span></span></code></pre>
+</div>
+
+<p>
+    For <em>N</em> = 1,000,000 that's <strong>977 blocks × 1024 threads = 1,000,448 threads</strong>.
+    The last 448 threads run with <code>idx ≥ N</code> and are guarded out by the
+    bounds check on line 22. (Launching extra threads is cheaper than launching a
+    second kernel for the tail.)
+</p>
+
+<!-- ===================================================================== -->
+<h2>3. The kernel itself</h2>
+
+<div class="code-block">
+<pre data-start-line="17" style="--start-line: 17;"><code><span class="line"><span class="kw">__global__</span> <span class="ty">void</span> <span class="fn">vectorAddGPU</span>(<span class="kw">const</span> <span class="ty">float</span>* A, <span class="kw">const</span> <span class="ty">float</span>* B, <span class="ty">float</span>* C, <span class="ty">int</span> N) {</span><span class="line">    <span class="cmt">// global thread index — unique across the entire grid</span></span><span class="line">    <span class="ty">int</span> idx = blockIdx.x * blockDim.x + threadIdx.x;</span><span class="line"></span><span class="line">    <span class="kw">if</span> (idx &lt; N) {</span><span class="line">        C[idx] = A[idx] + B[idx];</span><span class="line">    }</span><span class="line">}</span></code></pre>
+</div>
+
+<p>
+    That's the whole kernel. Three loads, one add, one store. Every thread does
+    exactly the same work on a different index. No shared memory, no
+    <code>__syncthreads</code>, no shuffles — nothing to share.
+</p>
+
+<!-- ===================================================================== -->
+<h2>4. How a warp actually runs this</h2>
+
+<p>
+    Pick a warp — say warp 0 of block 0, which is threads with
+    <code>threadIdx.x = 0..31</code>. Their global <code>idx</code> values are 0..31.
+    Step through what happens.
+</p>
+
+<div class="figure" id="fig-vec">
+    <svg viewBox="0 0 720 400" preserveAspectRatio="xMidYMid meet">
+        <text x="120" y="22" text-anchor="middle" class="svg-title">A in DRAM</text>
+        <text x="280" y="22" text-anchor="middle" class="svg-title">B in DRAM</text>
+        <text x="500" y="22" text-anchor="middle" class="svg-title">Registers (per-thread)</text>
+        <text x="650" y="22" text-anchor="middle" class="svg-title">C in DRAM</text>
+
+        <g id="vA" transform="translate(40,40)"></g>
+        <g id="vB" transform="translate(200,40)"></g>
+        <g id="vR" transform="translate(420,40)"></g>
+        <g id="vC" transform="translate(580,40)"></g>
+
+        <!-- "warp" pill -->
+        <rect id="vWarpBox" x="35" y="38" width="660" height="36" rx="6"
+              fill="none" stroke="#8250df" stroke-width="2" opacity="0"/>
+        <text x="360" y="100" text-anchor="middle" class="svg-dim" id="vInstr">warp 0 · 32 threads · idle</text>
+
+        <!-- fat arrows -->
+        <g id="vLoadA" opacity="0">
+            <rect x="80"  y="280" width="80"  height="14" rx="3" fill="#cce5ff" stroke="#0969da"/>
+            <text x="120" y="310" text-anchor="middle" class="svg-lbl" fill="#0969da">load A · 1 trans</text>
+        </g>
+        <g id="vLoadB" opacity="0">
+            <rect x="240" y="280" width="80"  height="14" rx="3" fill="#cce5ff" stroke="#0969da"/>
+            <text x="280" y="310" text-anchor="middle" class="svg-lbl" fill="#0969da">load B · 1 trans</text>
+        </g>
+        <g id="vAdd" opacity="0">
+            <rect x="420" y="280" width="160" height="14" rx="3" fill="#dafbe1" stroke="#1a7f37"/>
+            <text x="500" y="310" text-anchor="middle" class="svg-lbl" fill="#1a7f37">add · register-only</text>
+        </g>
+        <g id="vStoreC" opacity="0">
+            <rect x="600" y="280" width="80"  height="14" rx="3" fill="#cce5ff" stroke="#0969da"/>
+            <text x="640" y="310" text-anchor="middle" class="svg-lbl" fill="#0969da">store C · 1 trans</text>
+        </g>
+
+        <text x="360" y="370" text-anchor="middle" class="svg-dim" id="vTally">total DRAM transactions for this warp: 0</text>
+    </svg>
+    <div class="caption" id="vCap">One warp of 32 threads runs the kernel in lockstep.</div>
+    <div class="controls">
+        <button data-act="prev">◂ Prev</button>
+        <button data-act="step">Step ▸</button>
+        <button data-act="reset">↺ Reset</button>
+        <span class="tick-label">step 1 / 6</span>
+    </div>
+</div>
+
+<!-- ===================================================================== -->
+<h2>5. Memory-hierarchy story</h2>
+
+<table>
+<tr><th>Step</th><th>Where bytes live</th><th>Coalesced?</th><th>Cost per warp</th></tr>
+<tr><td>Load <code>A[idx]</code></td><td>DRAM → L2 → L1 → register</td><td><span style="color:var(--good);">yes</span></td><td>1 transaction · 128 B</td></tr>
+<tr><td>Load <code>B[idx]</code></td><td>DRAM → L2 → L1 → register</td><td><span style="color:var(--good);">yes</span></td><td>1 transaction · 128 B</td></tr>
+<tr><td>Add</td><td>register only</td><td>—</td><td>1 cycle of ALU</td></tr>
+<tr><td>Store <code>C[idx]</code></td><td>register → L2 → DRAM</td><td><span style="color:var(--good);">yes</span></td><td>1 transaction · 128 B</td></tr>
+</table>
+
+<p>
+    Every warp moves <strong>384 bytes</strong> of DRAM traffic (128 in for A,
+    128 in for B, 128 out for C) and does <strong>32 floating-point adds</strong>.
+    The ratio of compute to memory traffic is comically low —
+    <strong>0.083 FLOP / byte</strong>. This kernel is the canonical
+    <em>memory-bound</em> example.
+</p>
+
+<!-- ===================================================================== -->
+<h2>6. Bandwidth math (the only number that matters)</h2>
+
+<p>
+    For <em>N</em> = 1,000,000 floats:
+</p>
+
+<ul>
+    <li>Bytes moved: <code>3 × N × 4 = 12 MB</code></li>
+    <li>1660 Super DRAM ceiling: <code>336 GB/s</code></li>
+    <li>Lower bound on time: <code>12 MB ÷ 336 GB/s ≈ 36 μs</code></li>
+</ul>
+
+<p>
+    On this card the kernel typically hits ~28–32 μs — within shouting distance
+    of the ceiling. There's nothing to optimize except making sure you didn't
+    accidentally break coalescing.
+</p>
+
+<div class="callout">
+    The mental ratio to remember: <strong>1 FP add ≈ 12 bytes of DRAM traffic</strong>
+    for this kernel. As long as compute is cheap and memory is expensive (which
+    is the universal case on this card), kernels like vector add will live in the
+    memory-bound regime, and the GPU's 5 TFLOPS of FP32 is mostly idle.
+</div>
+
+<!-- ===================================================================== -->
+<h2>7. Why this kernel is "boring" (and that's the lesson)</h2>
+
+<ul>
+    <li><strong>No shared memory.</strong> Nothing to share — each thread's
+        element is independent.</li>
+    <li><strong>No bank conflicts</strong> — no shared memory.</li>
+    <li><strong>No divergence.</strong> The only <code>if</code> is the bounds
+        check at the very end of the grid; threads in a warp either all pass
+        or (for the last warp) divide cleanly between in-bounds and out-of-bounds.</li>
+    <li><strong>Perfect coalescing.</strong> Thread <em>i</em> in a warp reads
+        address <em>base + 4i</em> for every load. The hardware merges into one
+        128-byte transaction per array per warp.</li>
+</ul>
+
+<p>
+    Everything that follows on this site is a story about <em>losing</em> one of
+    these properties and earning it back. Transpose loses coalescing on the write
+    and earns it back with shared memory. Softmax loses parallelism for the
+    reduction and earns it back with a tree. Flash attention loses re-use and
+    earns it back with online softmax. Vector add is the baseline: this is what
+    the GPU does when nothing gets in its way.
+</p>
+
+<footer>
+    Next: <a href="softmax.html">→ Softmax</a> — where we discover that some
+    operations don't fit into "every thread does its own thing".
+</footer>
+
+</main>
+
+<script>
+class StepFig {
+    constructor(figEl, ticks) {
+        this.fig = figEl; this.ticks = ticks; this.idx = 0;
+        this.cap = figEl.querySelector('.caption');
+        this.tickLabel = figEl.querySelector('.tick-label');
+        this.btnPrev  = figEl.querySelector('[data-act=prev]');
+        this.btnStep  = figEl.querySelector('[data-act=step]');
+        this.btnReset = figEl.querySelector('[data-act=reset]');
+        if (this.btnPrev)  this.btnPrev.addEventListener('click', () => this.prev());
+        if (this.btnStep)  this.btnStep.addEventListener('click', () => this.step());
+        if (this.btnReset) this.btnReset.addEventListener('click', () => this.reset());
+        this.render();
+    }
+    render() {
+        this.ticks[this.idx].apply();
+        if (this.cap) this.cap.textContent = this.ticks[this.idx].caption;
+        if (this.tickLabel) this.tickLabel.textContent = `step ${this.idx + 1} / ${this.ticks.length}`;
+        if (this.btnPrev) this.btnPrev.disabled = (this.idx === 0);
+        if (this.btnStep) this.btnStep.disabled = (this.idx === this.ticks.length - 1);
+    }
+    step()  { if (this.idx < this.ticks.length - 1) { this.idx++; this.render(); } }
+    prev()  { if (this.idx > 0) { this.idx--; this.render(); } }
+    reset() { this.idx = 0; this.render(); }
+}
+const NS = 'http://www.w3.org/2000/svg';
+function mk(tag, attrs = {}, parent = null) {
+    const el = document.createElementNS(NS, tag);
+    for (const k in attrs) el.setAttribute(k, attrs[k]);
+    if (parent) parent.appendChild(el);
+    return el;
+}
+
+// ===================================================================
+// Figure: vector add warp execution
+// ===================================================================
+(function () {
+    const fig = document.getElementById('fig-vec');
+    const N = 8; // visualizing 8 of 32 threads
+    const cw = 18;
+    const vA = fig.querySelector('#vA');
+    const vB = fig.querySelector('#vB');
+    const vR = fig.querySelector('#vR');
+    const vC = fig.querySelector('#vC');
+    const aCells = [], bCells = [], rCells = [], cCells = [];
+    for (let i = 0; i < N; i++) {
+        aCells.push(mk('rect', { x: i*cw, y: 0, width: cw-2, height: 30, rx: 2,
+            fill: '#ffebe9', stroke: '#cf222e' }, vA));
+        bCells.push(mk('rect', { x: i*cw, y: 0, width: cw-2, height: 30, rx: 2,
+            fill: '#ffebe9', stroke: '#cf222e' }, vB));
+        rCells.push(mk('rect', { x: i*cw, y: 0, width: cw-2, height: 30, rx: 2,
+            fill: '#dafbe1', stroke: '#1a7f37' }, vR));
+        cCells.push(mk('rect', { x: i*cw, y: 0, width: cw-2, height: 30, rx: 2,
+            fill: '#ffebe9', stroke: '#cf222e' }, vC));
+    }
+    const warpBox = fig.querySelector('#vWarpBox');
+    const instr = fig.querySelector('#vInstr');
+    const tally = fig.querySelector('#vTally');
+    const vLoadA = fig.querySelector('#vLoadA');
+    const vLoadB = fig.querySelector('#vLoadB');
+    const vAdd   = fig.querySelector('#vAdd');
+    const vStoreC = fig.querySelector('#vStoreC');
+
+    function paint(cells, color) {
+        cells.forEach(c => c.setAttribute('fill', color));
+    }
+    function setState(s) {
+        warpBox.setAttribute('opacity', s.warpBox);
+        instr.textContent = s.instr;
+        tally.textContent = s.tally;
+        vLoadA.setAttribute('opacity', s.la);
+        vLoadB.setAttribute('opacity', s.lb);
+        vAdd.setAttribute('opacity',   s.add);
+        vStoreC.setAttribute('opacity', s.sc);
+        paint(aCells, s.aFill);
+        paint(bCells, s.bFill);
+        paint(rCells, s.rFill);
+        paint(cCells, s.cFill);
+    }
+    const RED = '#ffebe9', RED_HOT = '#7fd296';
+    const GRN = '#dafbe1', GRN_HOT = '#7fd296';
+    const CRED = '#ffebe9', CRED_HOT = '#7fd296';
+
+    const ticks = [
+        { caption: 'Initial: warp 0 has 32 threads with idx = 0..31. Registers empty. A, B sit in DRAM. C is empty in DRAM.',
+          apply: () => setState({ warpBox: 0, instr: 'warp 0 · idle', tally: 'DRAM transactions: 0',
+            la:0, lb:0, add:0, sc:0,
+            aFill: RED, bFill: RED, rFill: GRN, cFill: CRED }) },
+        { caption: 'Cycle 1 — scheduler issues "LD A". All 32 threads load consecutive A[idx] → ONE coalesced DRAM transaction.',
+          apply: () => setState({ warpBox: 1, instr: 'LD reg, A[idx]', tally: 'DRAM transactions: 1',
+            la:1, lb:0, add:0, sc:0,
+            aFill: RED_HOT, bFill: RED, rFill: GRN, cFill: CRED }) },
+        { caption: 'Cycle 2 — "LD B". Another coalesced transaction. Registers now hold both operands.',
+          apply: () => setState({ warpBox: 1, instr: 'LD reg, B[idx]', tally: 'DRAM transactions: 2',
+            la:1, lb:1, add:0, sc:0,
+            aFill: RED_HOT, bFill: RED_HOT, rFill: '#b6e3c4', cFill: CRED }) },
+        { caption: 'Cycle 3 — "ADD". Pure register-to-register. No DRAM touched. 32 ALU ops in one cycle (or 2 on smaller SMs).',
+          apply: () => setState({ warpBox: 1, instr: 'ADD reg, reg, reg', tally: 'DRAM transactions: 2',
+            la:1, lb:1, add:1, sc:0,
+            aFill: RED_HOT, bFill: RED_HOT, rFill: GRN_HOT, cFill: CRED }) },
+        { caption: 'Cycle 4 — "ST C". 32 threads write consecutive C[idx] → ONE coalesced DRAM transaction.',
+          apply: () => setState({ warpBox: 1, instr: 'ST C[idx], reg', tally: 'DRAM transactions: 3',
+            la:1, lb:1, add:1, sc:1,
+            aFill: RED_HOT, bFill: RED_HOT, rFill: GRN_HOT, cFill: CRED_HOT }) },
+        { caption: 'Done. 3 transactions × 128 B = 384 bytes moved, 32 adds done. Perfectly memory-bound — no waste anywhere.',
+          apply: () => setState({ warpBox: 1, instr: 'warp retires', tally: 'DRAM transactions: 3 (perfect)',
+            la:1, lb:1, add:1, sc:1,
+            aFill: RED_HOT, bFill: RED_HOT, rFill: GRN_HOT, cFill: CRED_HOT }) },
+    ];
+    new StepFig(fig, ticks);
+})();
+</script>
+</body>
+</html>

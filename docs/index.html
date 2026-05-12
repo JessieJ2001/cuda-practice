@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>LeetGPU — Kernel Walkthroughs</title>
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+
+<nav class="topnav">
+    <span class="brand">leetgpu/</span>
+    <a href="index.html">index</a>
+    <a href="primer.html">primer</a>
+    <a href="transpose.html">transpose</a>
+    <a href="vector_addition.html">vector_addition</a>
+    <a href="softmax.html">softmax</a>
+    <a href="topk.html">topk</a>
+    <a href="attention.html">attention</a>
+    <a href="flash_attention.html">flash_attention</a>
+    <span class="spacer"></span>
+    <span class="dim">target: GTX 1660 Super (Turing TU116)</span>
+</nav>
+
+<main>
+    <h1>LeetGPU — Kernel Walkthroughs</h1>
+    <p>
+        A hands-on tour of six CUDA kernels, written for someone who has <em>never</em> touched a GPU before.
+        Every optimization is grounded in the actual hardware sitting on the desk: a
+        <strong>GeForce GTX 1660 Super</strong> (Turing TU116) — 22 SMs, 1408 cores,
+        6&nbsp;GB GDDR6, 336&nbsp;GB/s DRAM bandwidth, 96&nbsp;KB combined L1/shared per SM,
+        1.5&nbsp;MB L2, <em>no L3, no tensor cores</em>.
+    </p>
+
+    <div class="callout">
+        <strong>How to read this site:</strong> start with the
+        <a href="primer.html">primer</a> if any of these terms feel fuzzy —
+        <span class="mono">DRAM, L1/L2 cache, shared memory, register, SM, CTA, warp, coalescing</span> —
+        then walk the kernels in order. Each page has step-by-step diagrams: click
+        <code>Step ▸</code> to advance, <code>◂ Prev</code> to go back. Nothing animates on its own.
+    </div>
+
+    <h2>Kernels, in pedagogical order</h2>
+    <p class="dim small">
+        Concepts build on each other. The first two teach <em>coalescing</em> and
+        <em>shared memory</em>. The next two teach <em>reductions</em> and
+        <em>atomic operations</em>. The last two teach <em>kernel fusion</em>.
+    </p>
+
+    <div class="card-grid">
+        <div class="card">
+            <a href="primer.html">
+                <div class="stage">step 0 · prerequisites</div>
+                <h3>GPU 101 Primer</h3>
+                <p>The mental model: memory hierarchy, SM, warp, coalescing, bank conflicts. Step-by-step diagrams.</p>
+            </a>
+        </div>
+
+        <div class="card">
+            <a href="vector_addition.html">
+                <div class="stage">step 1 · the baseline</div>
+                <h3>Vector Addition</h3>
+                <p>The simplest possible kernel. Used to nail down warps, lockstep execution, and what perfect coalescing looks like.</p>
+            </a>
+        </div>
+
+        <div class="card">
+            <a href="transpose.html">
+                <div class="stage">step 2 · coalescing + shared memory</div>
+                <h3>Matrix Transpose</h3>
+                <p>Why the naive version wastes 32× the bandwidth, and how a 32×32 shared-memory tile (with one extra column!) fixes it.</p>
+            </a>
+        </div>
+
+        <div class="card">
+            <a href="softmax.html">
+                <div class="stage">step 3 · reductions</div>
+                <h3>Softmax</h3>
+                <p>Three kernels, two tree-reductions, one numerical-stability trick (subtract the max), and a global atomic-add to combine block results.</p>
+            </a>
+        </div>
+
+        <div class="card">
+            <a href="topk.html">
+                <div class="stage">step 4 · atomics + shared histograms</div>
+                <h3>Top-K</h3>
+                <p>A radix-bucket histogram in shared memory plus a binary search over 4-bit digits — find the K-th value without sorting.</p>
+            </a>
+        </div>
+
+        <div class="card">
+            <a href="attention.html">
+                <div class="stage">step 5 · naive attention</div>
+                <h3>Attention</h3>
+                <p>Three kernel launches and one big [M × N] scores matrix sitting in DRAM. The textbook decomposition — and the bandwidth villain.</p>
+            </a>
+        </div>
+
+        <div class="card">
+            <a href="flash_attention.html">
+                <div class="stage">step 6 · fused + online softmax</div>
+                <h3>Flash Attention</h3>
+                <p>One kernel, no [M × N] buffer, streaming K/V with a running max and denominator. The trade: re-reading K, V for a clean memory footprint.</p>
+            </a>
+        </div>
+    </div>
+
+    <h2>Conventions used on every page</h2>
+
+    <div class="legend">
+        <span><span class="swatch" style="background:#ffebe9;border-color:#cf222e"></span>DRAM (off-chip)</span>
+        <span><span class="swatch" style="background:#fff1cf;border-color:#bf8700"></span>L2 cache</span>
+        <span><span class="swatch" style="background:#fff8c5;border-color:#9a6700"></span>L1 / shared (SRAM)</span>
+        <span><span class="swatch" style="background:#dafbe1;border-color:#1a7f37"></span>register</span>
+        <span><span class="swatch" style="background:#fbefff;border-color:#8250df"></span>warp</span>
+    </div>
+
+    <p class="small dim">
+        The same five colors mean the same thing on every page, so you build one
+        mental color-map and reuse it.
+    </p>
+
+    <footer>
+        Source kernels live in <code>/workspaces/leetgpu-master/</code>.
+        Each kernel page cites line numbers like <code>transpose.cu:33</code> —
+        the numbers match the actual source.
+    </footer>
+</main>
+</body>
+</html>

@@ -1,0 +1,548 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Top-K — LeetGPU</title>
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+
+<nav class="topnav">
+    <span class="brand">leetgpu/</span>
+    <a href="index.html">index</a>
+    <a href="primer.html">primer</a>
+    <a href="transpose.html">transpose</a>
+    <a href="vector_addition.html">vector_addition</a>
+    <a href="softmax.html">softmax</a>
+    <a href="topk.html">topk</a>
+    <span class="spacer"></span>
+    <span class="dim">target: GTX 1660 Super</span>
+</nav>
+
+<main>
+
+<h1>Top-K Selection</h1>
+
+<div class="callout">
+    <strong>TL;DR.</strong> Don't sort the whole array. Treat each float as a
+    bit pattern and <em>bin it by its top few bits</em> in a shared-memory
+    histogram. A tiny CPU loop walks the histogram to find which bucket holds
+    the K-th element. Then drill into that bucket's bits with another pass.
+    After ~8 passes the K-th value is pinned down; one final filter kernel
+    sweeps the array and atomically grabs every element ≥ threshold.
+</div>
+
+<p class="small dim">
+    Source: <a href="../topk.cu">/workspaces/leetgpu-master/topk.cu</a>.
+</p>
+
+<div class="legend">
+    <span><span class="swatch" style="background:#ffebe9;border-color:#cf222e"></span>DRAM</span>
+    <span><span class="swatch" style="background:#fff1cf;border-color:#bf8700"></span>L2</span>
+    <span><span class="swatch" style="background:#fff8c5;border-color:#9a6700"></span>L1 / shared</span>
+    <span><span class="swatch" style="background:#dafbe1;border-color:#1a7f37"></span>register</span>
+    <span><span class="swatch" style="background:#fbefff;border-color:#8250df"></span>warp</span>
+</div>
+
+<!-- ===================================================================== -->
+<h2>1. The problem (and why sorting is wrong)</h2>
+
+<p>
+    Given <em>N</em> floats and a target <em>K</em>, return the K largest. The
+    CPU does this with <code>std::partial_sort</code> in O(N log K) — fast,
+    but inherently sequential.
+</p>
+
+<p>
+    On a GPU we have ~22 SMs sitting idle if we serialize. The real question
+    becomes: <strong>can we find the K-th largest value without sorting?</strong>
+    Yes — by repeatedly bucketing on bits of the input. The algorithm is called
+    <em>radix select</em>.
+</p>
+
+<!-- ===================================================================== -->
+<h2>2. The high-level algorithm</h2>
+
+<ol>
+    <li><strong>Pass 1.</strong> Look at the top 4 bits of each float's bit
+        pattern. Drop each element into one of 16 buckets. Count bucket sizes.</li>
+    <li><strong>CPU walks the histogram.</strong> Starting from the largest
+        bucket (highest bits = biggest value), sum sizes until the running total
+        reaches K. That bucket contains the K-th largest. Remember its prefix.</li>
+    <li><strong>Pass 2.</strong> Look at the <em>next</em> 4 bits, but only
+        for elements whose top bits match the locked prefix. Build a 16-bucket
+        histogram again.</li>
+    <li><strong>Repeat</strong> until only one element matches → that's the
+        threshold value.</li>
+    <li><strong>Filter pass.</strong> Sweep the array; every element ≥ threshold
+        joins the output via <code>atomicAdd</code>.</li>
+</ol>
+
+<div class="figure" id="fig-topk-overview">
+    <svg viewBox="0 0 720 300" preserveAspectRatio="xMidYMid meet">
+        <text x="360" y="22" text-anchor="middle" class="svg-title" id="tkT">Pass 0 — empty histogram</text>
+
+        <!-- Input row -->
+        <g id="tkInput" transform="translate(40,40)"></g>
+        <text x="20" y="58" class="svg-dim">input</text>
+
+        <!-- Buckets -->
+        <g id="tkBuckets" transform="translate(40,120)"></g>
+        <text x="20" y="138" class="svg-dim">buckets (top 4 bits)</text>
+
+        <text x="360" y="220" text-anchor="middle" class="svg-dim" id="tkStatus">click Step ▸ to drop elements into buckets</text>
+        <text x="360" y="245" text-anchor="middle" class="svg-dim" id="tkCounts"></text>
+        <text x="360" y="270" text-anchor="middle" class="svg-dim" id="tkVerdict"></text>
+    </svg>
+    <div class="caption" id="tkCap">Walk through one pass of radix bucketing on 8 small integers (top-3).</div>
+    <div class="controls">
+        <button data-act="prev">◂ Prev</button>
+        <button data-act="step">Step ▸</button>
+        <button data-act="reset">↺ Reset</button>
+        <span class="tick-label">step 1 / 6</span>
+    </div>
+</div>
+
+<!-- ===================================================================== -->
+<h2>3. Inside <code>radixSelectk</code> — the histogram kernel</h2>
+
+<p>
+    This is the workhorse, run once per radix pass
+    (<code>topk.cu:73–104</code>):
+</p>
+
+<div class="code-block">
+<pre data-start-line="72" style="--start-line: 72;"><code><span class="line"><span class="kw">__global__</span> <span class="ty">void</span> <span class="fn">radixSelectk</span>(<span class="kw">const</span> <span class="ty">float</span>* input, <span class="ty">int</span>* output, <span class="ty">int</span> N, <span class="ty">int</span> prefix_val, <span class="ty">int</span> radix_offset) {</span><span class="line">    <span class="kw">__shared__</span> <span class="ty">int</span> hist[NumBuckets];                       <span class="cmt">// per-CTA histogram (~16 ints)</span></span><span class="line"></span><span class="line">    <span class="kw">if</span> (threadIdx.x &lt; NumBuckets) hist[threadIdx.x] = <span class="num">0</span>;</span><span class="line">    <span class="fn">__syncthreads</span>();</span><span class="line"></span><span class="line">    <span class="ty">int</span> shift = <span class="num">32</span> - RadixBits - radix_offset;</span><span class="line">    <span class="ty">uint32_t</span> prefix_mask = ((<span class="num">1</span> &lt;&lt; radix_offset) - <span class="num">1</span>) &lt;&lt; (<span class="num">32</span> - radix_offset);</span><span class="line"></span><span class="line">    <span class="kw">for</span> (<span class="ty">int</span> i = blockIdx.x * blockDim.x + threadIdx.x; i &lt; N; i += gridDim.x * blockDim.x) {</span><span class="line">        <span class="ty">float</span> val = input[i];</span><span class="line">        <span class="ty">uint32_t</span> uval = <span class="kw">reinterpret_cast</span>&lt;<span class="ty">uint32_t</span>&amp;&gt;(val);          <span class="cmt">// bit-cast float → uint32</span></span><span class="line">        <span class="kw">if</span> ((uval &amp; prefix_mask) != prefix_val) <span class="kw">continue</span>;            <span class="cmt">// not in our search slice</span></span><span class="line">        <span class="kw">auto</span> bucket = (uval &gt;&gt; shift) &amp; RadixMask;                  <span class="cmt">// extract radix digit</span></span><span class="line">        <span class="fn">atomicAdd</span>(&amp;hist[bucket], <span class="num">1</span>);                              <span class="cmt">// shared-memory atomic</span></span><span class="line">    }</span><span class="line">    <span class="fn">__syncthreads</span>();</span><span class="line"></span><span class="line">    <span class="kw">for</span> (<span class="ty">int</span> histid = threadIdx.x; histid &lt; NumBuckets; histid += blockDim.x) {</span><span class="line">        <span class="fn">atomicAdd</span>(&amp;output[histid], hist[histid]);                  <span class="cmt">// merge into global hist</span></span><span class="line">    }</span><span class="line">}</span></code></pre>
+</div>
+
+<p>Three patterns to call out:</p>
+
+<h3>Grid-stride loop</h3>
+
+<p>
+    Line 85 doesn't do "one element per thread". Instead each thread starts at
+    its global index and strides by <code>gridDim.x * blockDim.x</code> (the
+    total number of threads) until it falls off the array. This lets one fixed
+    grid (<code>num_sms * 4</code> CTAs, line 149) chew through an array of any
+    size — no per-call resize.
+</p>
+
+<h3>Per-CTA shared histogram</h3>
+
+<p>
+    Every CTA gets its own <code>hist[16]</code> in shared memory. Each element
+    does one <code>atomicAdd</code> against this private histogram. Shared-memory
+    atomics are <em>way</em> faster than global atomics because they don't
+    serialize across the chip — they only serialize across one SM.
+</p>
+
+<h3>One global merge at the end</h3>
+
+<p>
+    After processing, threads 0..15 of each CTA atomically add their private
+    histogram into the global one. <strong>16 global atomics per CTA</strong>,
+    not N atomics. This is the key optimization that makes histogramming on
+    a GPU competitive.
+</p>
+
+<div class="figure" id="fig-hist">
+    <svg viewBox="0 0 720 380" preserveAspectRatio="xMidYMid meet">
+        <text x="160" y="22" text-anchor="middle" class="svg-title">CTA 0 · shared hist</text>
+        <text x="360" y="22" text-anchor="middle" class="svg-title">CTA 1 · shared hist</text>
+        <text x="560" y="22" text-anchor="middle" class="svg-title">CTA 2 · shared hist</text>
+
+        <g id="hC0" transform="translate(40,50)"></g>
+        <g id="hC1" transform="translate(240,50)"></g>
+        <g id="hC2" transform="translate(440,50)"></g>
+
+        <!-- Global hist -->
+        <text x="360" y="220" text-anchor="middle" class="svg-title">Global histogram (DRAM)</text>
+        <g id="hG" transform="translate(140,240)"></g>
+        <text x="360" y="320" text-anchor="middle" class="svg-dim" id="hStatus">SM-local atomics during processing · one merge per CTA at the end</text>
+    </svg>
+    <div class="caption" id="hCap">Why per-CTA histograms cut global atomic traffic by a factor of (threads-per-CTA).</div>
+    <div class="controls">
+        <button data-act="prev">◂ Prev</button>
+        <button data-act="step">Step ▸</button>
+        <button data-act="reset">↺ Reset</button>
+        <span class="tick-label">step 1 / 5</span>
+    </div>
+</div>
+
+<!-- ===================================================================== -->
+<h2>4. The CPU loop that drives it (<code>topk.cu:166–206</code>)</h2>
+
+<p>
+    The host walks the histogram each pass to decide which bucket to drill into.
+    This is fundamentally serial — but it's <em>16 bucket comparisons</em>, not
+    N comparisons. The kernel does the parallel work, the CPU does the tiny
+    control flow.
+</p>
+
+<pre><code>cur_k = N + 1 - K;        // we're looking for the K-th-largest, i.e. (N-K+1)-th smallest
+prefix_val = 0;
+for radix_offset in (0, 4, 8, …, 28):
+    launch zero(hist)
+    launch radixSelectk(input, hist, N, prefix_val, radix_offset)
+    cudaMemcpy hist → host
+    sum = 0
+    for b in 0..15:
+        if sum + hist[b] ≥ cur_k:           // this bucket contains the K-th element
+            prefix_val |= b shifted into position
+            cur_k -= sum
+            if hist[b] == 1:                // unique → we have the value
+                launch locateValue(...)
+            break
+        sum += hist[b]</code></pre>
+
+<p>
+    Note the <code>cudaMemcpy</code> in the middle of the loop — that's a
+    <strong>device-to-host round-trip every pass</strong>. It's the cost of doing
+    the bucket-selection decision on the CPU. Up to 8 passes × ~5 μs each, so
+    ~40 μs of overhead. For huge N (millions+) the kernel time dominates and
+    this is fine. For small N you'd want to do the decision on the GPU too.
+</p>
+
+<!-- ===================================================================== -->
+<h2>5. The final filter pass (<code>topk.cu:122–131</code>)</h2>
+
+<p>
+    Once the threshold value is pinned down, one more grid-stride kernel sweeps
+    the array. Every element ≥ threshold competes for a slot in the output via
+    a single global atomic counter:
+</p>
+
+<div class="code-block">
+<pre data-start-line="121" style="--start-line: 121;"><code><span class="line"><span class="kw">__global__</span> <span class="ty">void</span> <span class="fn">filterK</span>(<span class="kw">const</span> <span class="ty">float</span> *input, <span class="ty">ValueIndex</span> *output, <span class="ty">int</span> *p_out_idx, <span class="ty">int</span> N, <span class="ty">float</span> selectk) {</span><span class="line">    <span class="kw">for</span> (<span class="ty">int</span> i = blockIdx.x * blockDim.x + threadIdx.x; i &lt; N; i += gridDim.x * blockDim.x) {</span><span class="line">        <span class="ty">float</span> val = input[i];</span><span class="line">        <span class="kw">if</span> (val &gt;= selectk) {</span><span class="line">            <span class="kw">auto</span> out_idx = <span class="fn">atomicAdd</span>(p_out_idx, <span class="num">1</span>);</span><span class="line">            output[out_idx] = <span class="ty">ValueIndex</span>{val, i};</span><span class="line">        }</span><span class="line">    }</span><span class="line">}</span></code></pre>
+</div>
+
+<p>
+    The output is <em>unsorted</em> — order depends on which CTA's thread happened
+    to win each atomic. That's fine for top-K (the order within the top K usually
+    doesn't matter; compare with the CPU's <code>topkCPU</code> which sorts only
+    because it can).
+</p>
+
+<!-- ===================================================================== -->
+<h2>6. Memory-hierarchy story</h2>
+
+<table>
+<tr><th>Pass</th><th>Reads</th><th>Shared mem</th><th>Atomics</th></tr>
+<tr><td>radixSelectk × ~8 passes</td><td>input[] (8× total, but cached in L2 after pass 1)</td><td>NumBuckets × 4 B per CTA</td><td>shared/CTA: N total · global: 16 × CTAs</td></tr>
+<tr><td>locateValue × 1</td><td>input[] (mostly L2 hit)</td><td>—</td><td>—</td></tr>
+<tr><td>filterK × 1</td><td>input[] (L2 hit)</td><td>—</td><td>1 per surviving element (~K of them)</td></tr>
+</table>
+
+<p>
+    The first <code>radixSelectk</code> pass is the only one that pays the full
+    DRAM bandwidth cost. All later passes find input bytes still in L2. So this
+    algorithm runs at <strong>~336 GB/s × 1</strong> regardless of K — the K
+    parameter affects only the tiny CPU loop.
+</p>
+
+<!-- ===================================================================== -->
+<h2>7. Subtle bits</h2>
+
+<ul>
+    <li><strong>Bit-cast trick.</strong> For positive IEEE-754 floats, the bit
+        pattern is monotonic — larger float = larger uint32. This is what lets
+        us do radix sort on float bits without floating-point comparison
+        instructions. (Negative floats break monotonicity; a real production
+        version XORs sign-bit-related fixups.)</li>
+    <li><strong>Why <code>num_sms * 4</code> CTAs.</strong> (Line 149.) Enough
+        to fill every SM with multiple resident blocks for latency hiding.
+        Going wider just costs more atomic contention without speeding up the
+        grid-stride loop.</li>
+    <li><strong>Shared-memory atomics on Turing</strong> are fast (~1 cycle when
+        uncontended) but Bank-conflicts and same-address contention cause
+        serialization. The comment at line 95 calls this out — for skewed input
+        distributions one bucket gets hammered.</li>
+    <li><strong>Atomic on a global counter for output indices</strong> is the
+        same pattern as a single-producer / multi-consumer queue. It works
+        because <em>K is small</em>; if K were N/2 the atomic would become a
+        bottleneck.</li>
+</ul>
+
+<!-- ===================================================================== -->
+<h2>8. Pitfalls</h2>
+
+<ul>
+    <li><strong>Forgetting to zero the histogram</strong> between passes — the kernel <code>zero</code> at <code>topk.cu:65</code> is called every iteration.</li>
+    <li><strong>Negative floats</strong> — the current code assumes positives, which is what the test harness generates.</li>
+    <li><strong>K close to N</strong> — atomic on the output counter becomes a bottleneck.</li>
+    <li><strong>Many duplicates of the threshold value</strong> — the filter could emit more than K elements. Production code adds a "stop at K" check; the source here doesn't.</li>
+</ul>
+
+<footer>
+    Next: <a href="attention.html">→ Attention</a> — three kernels with a fat
+    <code>[M × N]</code> matrix in the middle. The bandwidth hog we'll fix in
+    flash attention.
+</footer>
+
+</main>
+
+<script>
+class StepFig {
+    constructor(figEl, ticks) {
+        this.fig = figEl; this.ticks = ticks; this.idx = 0;
+        this.cap = figEl.querySelector('.caption');
+        this.tickLabel = figEl.querySelector('.tick-label');
+        this.btnPrev  = figEl.querySelector('[data-act=prev]');
+        this.btnStep  = figEl.querySelector('[data-act=step]');
+        this.btnReset = figEl.querySelector('[data-act=reset]');
+        if (this.btnPrev)  this.btnPrev.addEventListener('click', () => this.prev());
+        if (this.btnStep)  this.btnStep.addEventListener('click', () => this.step());
+        if (this.btnReset) this.btnReset.addEventListener('click', () => this.reset());
+        this.render();
+    }
+    render() {
+        this.ticks[this.idx].apply();
+        if (this.cap) this.cap.textContent = this.ticks[this.idx].caption;
+        if (this.tickLabel) this.tickLabel.textContent = `step ${this.idx + 1} / ${this.ticks.length}`;
+        if (this.btnPrev) this.btnPrev.disabled = (this.idx === 0);
+        if (this.btnStep) this.btnStep.disabled = (this.idx === this.ticks.length - 1);
+    }
+    step()  { if (this.idx < this.ticks.length - 1) { this.idx++; this.render(); } }
+    prev()  { if (this.idx > 0) { this.idx--; this.render(); } }
+    reset() { this.idx = 0; this.render(); }
+}
+const NS = 'http://www.w3.org/2000/svg';
+function mk(tag, attrs = {}, parent = null) {
+    const el = document.createElementNS(NS, tag);
+    for (const k in attrs) el.setAttribute(k, attrs[k]);
+    if (parent) parent.appendChild(el);
+    return el;
+}
+
+// ===================================================================
+// Figure: radix-bucket walkthrough (8 small ints, 4 buckets)
+// values: 7, 12, 3, 14, 5, 11, 9, 13.  Top 2 bits split into 4 buckets:
+//   bucket 0 = [0..3]   → {3}
+//   bucket 1 = [4..7]   → {7, 5}
+//   bucket 2 = [8..11]  → {11, 9}
+//   bucket 3 = [12..15] → {12, 14, 13}
+// We want top-3 = {14, 13, 12} → bucket 3 contains exactly 3 elements.
+// ===================================================================
+(function () {
+    const fig = document.getElementById('fig-topk-overview');
+    const tkInput = fig.querySelector('#tkInput');
+    const tkBuckets = fig.querySelector('#tkBuckets');
+    const title = fig.querySelector('#tkT');
+    const status = fig.querySelector('#tkStatus');
+    const counts = fig.querySelector('#tkCounts');
+    const verdict = fig.querySelector('#tkVerdict');
+
+    const N = 8;
+    const vals = [7, 12, 3, 14, 5, 11, 9, 13];
+    const bucketOf = v => Math.floor(v / 4);   // 4 buckets of 4 values each
+
+    const cellW = 70;
+    const inCells = [], inLabels = [];
+    for (let i = 0; i < N; i++) {
+        inCells.push(mk('rect', { x: i*cellW, y: 0, width: cellW-8, height: 40, rx: 4,
+            fill: '#ffebe9', stroke: '#cf222e' }, tkInput));
+        inLabels.push(mk('text', { x: i*cellW + (cellW-8)/2, y: 26, 'text-anchor': 'middle', class: 'svg-lbl' }, tkInput));
+        inLabels[i].textContent = vals[i];
+    }
+    const bCellW = 120;
+    const buckets = [], bLabels = [];
+    const bnames = ['bucket 0\n(values 0–3)', 'bucket 1\n(4–7)', 'bucket 2\n(8–11)', 'bucket 3\n(12–15)'];
+    for (let b = 0; b < 4; b++) {
+        buckets.push(mk('rect', { x: b*bCellW + 80, y: 0, width: bCellW-8, height: 50, rx: 4,
+            fill: '#fff8c5', stroke: '#9a6700' }, tkBuckets));
+        const tn = bnames[b].split('\n');
+        mk('text', { x: b*bCellW + 80 + (bCellW-8)/2, y: 18, 'text-anchor': 'middle', class: 'svg-dim' }, tkBuckets).textContent = tn[0];
+        mk('text', { x: b*bCellW + 80 + (bCellW-8)/2, y: 32, 'text-anchor': 'middle', class: 'svg-dim' }, tkBuckets).textContent = tn[1];
+        bLabels.push(mk('text', { x: b*bCellW + 80 + (bCellW-8)/2, y: 47, 'text-anchor': 'middle', class: 'svg-lbl' }, tkBuckets));
+        bLabels[b].textContent = 'count: 0';
+    }
+
+    function paint(cellFills, bucketFills, counts4) {
+        for (let i = 0; i < N; i++) inCells[i].setAttribute('fill', cellFills[i]);
+        for (let b = 0; b < 4; b++) {
+            buckets[b].setAttribute('fill', bucketFills[b]);
+            bLabels[b].textContent = `count: ${counts4[b]}`;
+        }
+    }
+    function dropUpTo(k) {
+        // determine cell colors based on bucket assignment after dropping first k items
+        const cellFills = [];
+        const counts4 = [0,0,0,0];
+        for (let i = 0; i < N; i++) {
+            if (i < k) {
+                counts4[bucketOf(vals[i])]++;
+                // map bucket index to color
+                const colors = ['#cae8ff', '#d8f3dc', '#fde2a8', '#f8b4b4'];
+                cellFills.push(colors[bucketOf(vals[i])]);
+            } else cellFills.push('#ffebe9');
+        }
+        const bucketFills = counts4.map(c => c > 0 ? '#e7d27a' : '#fff8c5');
+        paint(cellFills, bucketFills, counts4);
+        return counts4;
+    }
+
+    const ticks = [
+        { caption: 'Inputs: 8 integers in [0,15]. K = 3 — we want the three largest values.',
+          apply: () => { title.textContent = 'Pass 0 — empty histogram';
+              dropUpTo(0);
+              status.textContent = 'each value goes into the bucket whose top 2 bits match it';
+              counts.textContent = ''; verdict.textContent = ''; } },
+        { caption: 'Drop first 4 values into their buckets — 7→1, 12→3, 3→0, 14→3.',
+          apply: () => { title.textContent = 'Pass 0 — bucketing in progress';
+              const c = dropUpTo(4);
+              status.textContent = '4 of 8 elements bucketed';
+              counts.textContent = `histogram so far: [${c.join(', ')}]`;
+              verdict.textContent = ''; } },
+        { caption: 'Drop the remaining values — 5→1, 11→2, 9→2, 13→3.',
+          apply: () => { title.textContent = 'Pass 0 — bucketing done';
+              const c = dropUpTo(8);
+              status.textContent = 'all elements assigned to buckets';
+              counts.textContent = `histogram: [${c.join(', ')}]`;
+              verdict.textContent = ''; } },
+        { caption: 'Now the CPU walks the histogram from largest bucket downward.',
+          apply: () => { title.textContent = 'CPU pass over histogram';
+              const c = dropUpTo(8);
+              // highlight bucket 3
+              buckets[3].setAttribute('fill', '#7fd296');
+              status.textContent = 'cumulative count from bucket 3 down: 3 + 2 + 2 + 1 = 8';
+              counts.textContent = 'bucket 3 alone has 3 elements ≥ count K=3 → answer is in bucket 3';
+              verdict.textContent = ''; } },
+        { caption: 'Bucket 3 has exactly K=3 elements. Lock in prefix = "12..15", drill into next bits if needed.',
+          apply: () => { title.textContent = 'Bucket 3 locked';
+              const c = dropUpTo(8);
+              buckets[3].setAttribute('fill', '#7fd296');
+              // grey out other buckets visually by softening
+              buckets[0].setAttribute('fill', '#f5f5f5');
+              buckets[1].setAttribute('fill', '#f5f5f5');
+              buckets[2].setAttribute('fill', '#f5f5f5');
+              for (let i = 0; i < N; i++) {
+                  if (bucketOf(vals[i]) !== 3) inCells[i].setAttribute('fill', '#f5f5f5');
+              }
+              status.textContent = 'next pass: histogram of next 2 bits, but ONLY for elements in bucket 3';
+              counts.textContent = 'survivors: {12, 14, 13}';
+              verdict.textContent = ''; } },
+        { caption: 'In this lucky case bucket 3 has exactly K elements → threshold = 12. The filter kernel grabs all values ≥ 12.',
+          apply: () => { title.textContent = 'Threshold pinned: 12 · filter pass next';
+              const c = dropUpTo(8);
+              for (let i = 0; i < N; i++) {
+                  if (vals[i] >= 12) inCells[i].setAttribute('fill', '#7fd296');
+                  else inCells[i].setAttribute('fill', '#f5f5f5');
+              }
+              for (let b = 0; b < 4; b++) buckets[b].setAttribute('fill', '#f5f5f5');
+              status.textContent = 'final filter: keep input[i] iff input[i] ≥ 12';
+              counts.textContent = '';
+              verdict.textContent = 'top-3 output (unordered): {12, 14, 13}'; } },
+    ];
+    new StepFig(fig, ticks);
+})();
+
+// ===================================================================
+// Figure: per-CTA histograms collapsed into a global one
+// ===================================================================
+(function () {
+    const fig = document.getElementById('fig-hist');
+    const N = 4;   // 4 buckets shown
+    const labels = ['b0','b1','b2','b3'];
+    const groups = ['#hC0','#hC1','#hC2'];
+    const cells = [[],[],[]];
+    for (let g = 0; g < 3; g++) {
+        const parent = fig.querySelector(groups[g]);
+        for (let i = 0; i < N; i++) {
+            cells[g].push(mk('rect', { x: i*36, y: 0, width: 30, height: 60, rx: 3,
+                fill: '#fff8c5', stroke: '#9a6700' }, parent));
+            mk('text', { x: i*36 + 15, y: 78, 'text-anchor': 'middle', class: 'svg-dim' }, parent)
+                .textContent = labels[i];
+        }
+    }
+    const gCells = [];
+    const gParent = fig.querySelector('#hG');
+    for (let i = 0; i < N; i++) {
+        gCells.push(mk('rect', { x: i*70, y: 0, width: 60, height: 60, rx: 3,
+            fill: '#ffebe9', stroke: '#cf222e' }, gParent));
+        mk('text', { x: i*70 + 30, y: 78, 'text-anchor': 'middle', class: 'svg-dim' }, gParent)
+            .textContent = labels[i];
+    }
+    const status = fig.querySelector('#hStatus');
+    // values per CTA
+    const v0 = [3,5,1,2], v1 = [2,4,3,1], v2 = [4,1,2,5];
+
+    function fill(g, vals, hot) {
+        const lblY = 38;
+        for (let i = 0; i < N; i++) {
+            const r = cells[g][i];
+            const t = r.parentNode.querySelector(`text[data-i="${i}"]`);
+            let txt = r.parentNode.querySelector(`text[data-i="v${i}"]`);
+            if (!txt) {
+                txt = mk('text', { x: i*36 + 15, y: lblY, 'text-anchor': 'middle', class: 'svg-lbl', 'data-i': 'v' + i }, r.parentNode);
+            }
+            txt.textContent = vals[i];
+            r.setAttribute('fill', hot && hot.includes(i) ? '#7fd296' : '#fff8c5');
+        }
+    }
+    function fillG(vals, hot) {
+        for (let i = 0; i < N; i++) {
+            const r = gCells[i];
+            let txt = r.parentNode.querySelector(`text[data-i="g${i}"]`);
+            if (!txt) {
+                txt = mk('text', { x: i*70 + 30, y: 38, 'text-anchor': 'middle', class: 'svg-lbl', 'data-i': 'g' + i }, r.parentNode);
+            }
+            txt.textContent = vals[i] === null ? '–' : vals[i];
+            r.setAttribute('fill', hot && hot.includes(i) ? '#7fd296' : '#ffebe9');
+        }
+    }
+    function clearGTexts() {
+        for (let i = 0; i < N; i++) {
+            const r = gCells[i];
+            const txt = r.parentNode.querySelector(`text[data-i="g${i}"]`);
+            if (txt) txt.textContent = '';
+        }
+    }
+    function clearCTexts(g) {
+        for (let i = 0; i < N; i++) {
+            const r = cells[g][i];
+            const txt = r.parentNode.querySelector(`text[data-i="v${i}"]`);
+            if (txt) txt.textContent = '';
+        }
+    }
+
+    const ticks = [
+        { caption: 'Three CTAs start with empty shared-memory histograms; the global histogram is also zero.',
+          apply: () => {
+              fill(0, ['','','',''], []); fill(1, ['','','',''], []); fill(2, ['','','',''], []);
+              clearCTexts(0); clearCTexts(1); clearCTexts(2);
+              fillG([null,null,null,null], []);
+              clearGTexts();
+              status.textContent = 'all four histograms zero · ready to process';
+          } },
+        { caption: 'Each CTA processes its slice of the array. Atomic adds to shared memory are fast — they only serialize within one SM.',
+          apply: () => {
+              fill(0, v0, []); fill(1, v1, []); fill(2, v2, []);
+              fillG([null,null,null,null], []);
+              clearGTexts();
+              status.textContent = 'per-CTA atomic traffic: ~N adds total, but each one stays inside one SM';
+          } },
+        { caption: 'Each CTA finishes. Now it must publish its histogram to the global one — one atomic per bucket.',
+          apply: () => {
+              fill(0, v0, [0,1,2,3]); fill(1, v1, [0,1,2,3]); fill(2, v2, [0,1,2,3]);
+              fillG([0,0,0,0], []);
+              status.textContent = 'each CTA does 4 atomicAdd()s to global · 3 CTAs × 4 = 12 global atomics';
+          } },
+        { caption: 'Global histogram accumulates the three partial histograms.',
+          apply: () => {
+              fill(0, v0, [0,1,2,3]); fill(1, v1, [0,1,2,3]); fill(2, v2, [0,1,2,3]);
+              fillG([v0[0]+v1[0]+v2[0], v0[1]+v1[1]+v2[1], v0[2]+v1[2]+v2[2], v0[3]+v1[3]+v2[3]], [0,1,2,3]);
+              status.textContent = 'global histogram now holds the true counts';
+          } },
+        { caption: 'Compare to "every thread atomic-adds to global" — that would be N global atomics. Per-CTA staging cuts it to (#buckets × #CTAs).',
+          apply: () => {
+              fill(0, v0, [0,1,2,3]); fill(1, v1, [0,1,2,3]); fill(2, v2, [0,1,2,3]);
+              fillG([v0[0]+v1[0]+v2[0], v0[1]+v1[1]+v2[1], v0[2]+v1[2]+v2[2], v0[3]+v1[3]+v2[3]], [0,1,2,3]);
+              status.textContent = 'savings: N / (buckets × CTAs) · for N=10k, that\'s ~100× fewer global atomics';
+          } },
+    ];
+    new StepFig(fig, ticks);
+})();
+</script>
+</body>
+</html>

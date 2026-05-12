@@ -1,0 +1,478 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Attention (naive) — LeetGPU</title>
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+
+<nav class="topnav">
+    <span class="brand">leetgpu/</span>
+    <a href="index.html">index</a>
+    <a href="primer.html">primer</a>
+    <a href="transpose.html">transpose</a>
+    <a href="vector_addition.html">vector_addition</a>
+    <a href="softmax.html">softmax</a>
+    <a href="topk.html">topk</a>
+    <a href="attention.html">attention</a>
+    <span class="spacer"></span>
+    <span class="dim">target: GTX 1660 Super</span>
+</nav>
+
+<main>
+
+<h1>Scaled Dot-Product Attention (naive)</h1>
+
+<div class="callout">
+    <strong>TL;DR.</strong> Three kernels back to back: build the
+    <code>[M × N]</code> scores matrix in DRAM, run row-wise softmax on it
+    in place, then multiply by V to produce the output. The middle matrix is
+    the bandwidth villain — it gets written to DRAM, read for softmax, read
+    again for the output multiply. Flash attention's whole reason for existing
+    is to avoid this round trip.
+</div>
+
+<p class="small dim">
+    Source: <a href="../attention.cu">/workspaces/leetgpu-master/attention.cu</a>.
+</p>
+
+<div class="legend">
+    <span><span class="swatch" style="background:#ffebe9;border-color:#cf222e"></span>DRAM</span>
+    <span><span class="swatch" style="background:#fff1cf;border-color:#bf8700"></span>L2</span>
+    <span><span class="swatch" style="background:#fff8c5;border-color:#9a6700"></span>L1 / shared</span>
+    <span><span class="swatch" style="background:#dafbe1;border-color:#1a7f37"></span>register</span>
+    <span><span class="swatch" style="background:#fbefff;border-color:#8250df"></span>warp</span>
+</div>
+
+<!-- ===================================================================== -->
+<h2>1. The math, in 3 lines</h2>
+
+<pre><code>scores = (Q · K^T) / sqrt(d)            // shape [M, N]
+P      = softmax_along_rows(scores)     // shape [M, N]
+O      = P · V                          // shape [M, d]</code></pre>
+
+<p>
+    Shapes: <code>Q</code> is <code>[M × d]</code>, <code>K</code> and
+    <code>V</code> are <code>[N × d]</code>. For the test harness
+    <em>M = N = 512, d = 64</em>. So we build a 512×512 = 262,144-entry
+    scores matrix in the middle. Remember that number.
+</p>
+
+<!-- ===================================================================== -->
+<h2>2. Why three kernels (again)</h2>
+
+<p>
+    Same constraint as <a href="softmax.html">softmax</a>: blocks on different
+    SMs can't synchronize. We need a global barrier between "scores done" and
+    "softmax starts", and another between "softmax done" and "output multiply
+    starts". The cheapest barrier is a kernel boundary.
+</p>
+
+<div class="figure">
+    <svg viewBox="0 0 720 240" preserveAspectRatio="xMidYMid meet">
+        <!-- Kernel 1 -->
+        <rect x="20" y="40" width="200" height="160" rx="10" fill="#fbefff" stroke="#8250df"/>
+        <text x="120" y="68" text-anchor="middle" class="svg-title">1) attentionScoresKernel</text>
+        <text x="120" y="92" text-anchor="middle" class="svg-dim">Q · K^T · scale</text>
+        <text x="120" y="112" text-anchor="middle" class="svg-dim">in:  Q [M·d], K [N·d]</text>
+        <text x="120" y="130" text-anchor="middle" class="svg-dim">out: scores [M·N]</text>
+        <text x="120" y="150" text-anchor="middle" class="svg-dim">block: 16×16</text>
+        <text x="120" y="180" text-anchor="middle" class="svg-dim">attention.cu:74</text>
+
+        <!-- Kernel 2 -->
+        <rect x="260" y="40" width="200" height="160" rx="10" fill="#dafbe1" stroke="#1a7f37"/>
+        <text x="360" y="68" text-anchor="middle" class="svg-title">2) softmaxRowsKernel</text>
+        <text x="360" y="92" text-anchor="middle" class="svg-dim">row-wise softmax</text>
+        <text x="360" y="112" text-anchor="middle" class="svg-dim">in:  scores [M·N]</text>
+        <text x="360" y="130" text-anchor="middle" class="svg-dim">out: scores [M·N] (in-place)</text>
+        <text x="360" y="150" text-anchor="middle" class="svg-dim">grid: M · block: 256</text>
+        <text x="360" y="180" text-anchor="middle" class="svg-dim">attention.cu:94</text>
+
+        <!-- Kernel 3 -->
+        <rect x="500" y="40" width="200" height="160" rx="10" fill="#fff1cf" stroke="#bf8700"/>
+        <text x="600" y="68" text-anchor="middle" class="svg-title">3) attentionOutputKernel</text>
+        <text x="600" y="92" text-anchor="middle" class="svg-dim">P · V</text>
+        <text x="600" y="112" text-anchor="middle" class="svg-dim">in:  scores [M·N], V [N·d]</text>
+        <text x="600" y="130" text-anchor="middle" class="svg-dim">out: O [M·d]</text>
+        <text x="600" y="150" text-anchor="middle" class="svg-dim">block: 32×8</text>
+        <text x="600" y="180" text-anchor="middle" class="svg-dim">attention.cu:135</text>
+
+        <path d="M 220 120 L 256 120" stroke="#0969da" stroke-width="2" marker-end="url(#an-arr)"/>
+        <path d="M 460 120 L 496 120" stroke="#0969da" stroke-width="2" marker-end="url(#an-arr)"/>
+        <defs>
+            <marker id="an-arr" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+                <path d="M0,0 L0,6 L9,3 z" fill="#0969da"/>
+            </marker>
+        </defs>
+    </svg>
+    <div class="caption">Pipeline. The [M×N] scores buffer is allocated once and reused (attention.cu:166).</div>
+</div>
+
+<!-- ===================================================================== -->
+<h2>3. Kernel 1 — scores</h2>
+
+<p>
+    One thread = one element of the <code>[M × N]</code> scores matrix. The
+    thread loads <code>Q[i]</code> and <code>K[j]</code> (both length <em>d</em>),
+    does the dot product in a single thread, and writes the result.
+</p>
+
+<div class="code-block">
+<pre data-start-line="73" style="--start-line: 73;"><code><span class="line"><span class="kw">__global__</span> <span class="ty">void</span> <span class="fn">attentionScoresKernel</span>(<span class="kw">const</span> <span class="ty">float</span>* <span class="kw">__restrict__</span> Q,</span><span class="line">                                       <span class="kw">const</span> <span class="ty">float</span>* <span class="kw">__restrict__</span> K,</span><span class="line">                                       <span class="ty">float</span>* <span class="kw">__restrict__</span> scores,</span><span class="line">                                       <span class="ty">int</span> M, <span class="ty">int</span> N, <span class="ty">int</span> d, <span class="ty">float</span> scale) {</span><span class="line">    <span class="ty">int</span> j = blockIdx.x * blockDim.x + threadIdx.x;     <span class="cmt">// column = key index</span></span><span class="line">    <span class="ty">int</span> i = blockIdx.y * blockDim.y + threadIdx.y;     <span class="cmt">// row    = query index</span></span><span class="line">    <span class="kw">if</span> (i &gt;= M || j &gt;= N) <span class="kw">return</span>;</span><span class="line"></span><span class="line">    <span class="ty">float</span> dot = <span class="num">0.0f</span>;</span><span class="line">    <span class="kw">const</span> <span class="ty">float</span>* q = Q + i * d;</span><span class="line">    <span class="kw">const</span> <span class="ty">float</span>* k = K + j * d;</span><span class="line">    <span class="kw">for</span> (<span class="ty">int</span> e = <span class="num">0</span>; e &lt; d; e++) dot += q[e] * k[e];</span><span class="line">    scores[i * N + j] = dot * scale;</span><span class="line">}</span></code></pre>
+</div>
+
+<p>
+    Block size 16×16 = 256 threads. Within a warp, <code>threadIdx.x</code>
+    varies (so <em>j</em> varies, <em>i</em> is fixed). That means all 32 threads
+    in a warp share the same Q row but read <em>different K rows</em>.
+</p>
+
+<h3>Memory access cost (one warp)</h3>
+
+<ul>
+    <li><strong>Q row:</strong> 32 threads all read the same <em>i</em>'th row.
+        The hardware broadcasts — one load fills all 32 threads via L1/L2.</li>
+    <li><strong>K rows:</strong> 32 threads read 32 different rows of K. For
+        each <em>e</em>, that's a strided read across DRAM —
+        <strong>uncoalesced</strong>. With <em>d</em> inner iterations, this kernel
+        is bandwidth-bound on the K reads.</li>
+    <li><strong>Compute:</strong> <em>d</em> multiply-adds per element × <em>M·N</em> elements = 2·M·N·d FLOP. For M=N=512, d=64 that's ~33 MFLOP — trivial on a 5 TFLOPS card.</li>
+</ul>
+
+<div class="callout warn">
+    A real attention kernel tiles Q and K into shared memory and does
+    block-matrix products (essentially a GEMM). The naive version above leaves
+    K's reads uncoalesced — easy to read, slow to run.
+</div>
+
+<!-- ===================================================================== -->
+<h2>4. Kernel 2 — row-wise softmax</h2>
+
+<p>
+    One CTA per row of <code>scores</code> (grid size = <em>M</em>). Inside the
+    block, 256 threads cooperate to do the same three-pass softmax we saw on
+    the <a href="softmax.html">softmax page</a>: row-max reduction, exp + sum
+    reduction, normalize. Three <code>__syncthreads()</code>-separated phases.
+</p>
+
+<div class="code-block">
+<pre data-start-line="93" style="--start-line: 93;"><code><span class="line"><span class="kw">__global__</span> <span class="ty">void</span> <span class="fn">softmaxRowsKernel</span>(<span class="ty">float</span>* <span class="kw">__restrict__</span> scores, <span class="ty">int</span> M, <span class="ty">int</span> N) {</span><span class="line">    <span class="ty">int</span> row = blockIdx.x;                       <span class="cmt">// one CTA per row</span></span><span class="line">    <span class="ty">float</span>* s = scores + row * N;</span><span class="line">    <span class="ty">int</span> t = threadIdx.x;</span><span class="line">    <span class="kw">__shared__</span> <span class="ty">float</span> buf[<span class="num">256</span>];</span><span class="line"></span><span class="line">    <span class="cmt">// Phase 1: row max via tree reduction</span></span><span class="line">    <span class="ty">float</span> local_max = -FLT_MAX;</span><span class="line">    <span class="kw">for</span> (<span class="ty">int</span> j = t; j &lt; N; j += blockDim.x) local_max = fmaxf(local_max, s[j]);</span><span class="line">    <span class="cmt">// … (tree reduction in shared mem, then row_max = buf[0])</span></span><span class="line"></span><span class="line">    <span class="cmt">// Phase 2: exp + sum (writes exp(s[j]-row_max) back into s, accumulates sum)</span></span><span class="line">    <span class="cmt">// Phase 3: normalize by inv_sum</span></span><span class="line">}</span></code></pre>
+</div>
+
+<p>
+    Why one CTA per row? Because a row is self-contained — the softmax
+    denominator only depends on values in that row. Different rows have no
+    data dependency, so they can run on different SMs in parallel without
+    needing any cross-block sync.
+</p>
+
+<div class="figure" id="fig-attn-sm">
+    <svg viewBox="0 0 720 380" preserveAspectRatio="xMidYMid meet">
+        <text x="360" y="22" text-anchor="middle" class="svg-title" id="asmT">Scores matrix [M × N]</text>
+
+        <!-- a small matrix -->
+        <g id="asmM" transform="translate(60,40)"></g>
+
+        <text x="360" y="280" text-anchor="middle" class="svg-dim" id="asmStatus">click Step ▸ to follow one row through softmax</text>
+        <text x="360" y="305" text-anchor="middle" class="svg-dim" id="asmStatus2"></text>
+    </svg>
+    <div class="caption" id="asmCap">Each CTA owns one row. M rows = M CTAs = M parallel softmaxes.</div>
+    <div class="controls">
+        <button data-act="prev">◂ Prev</button>
+        <button data-act="step">Step ▸</button>
+        <button data-act="reset">↺ Reset</button>
+        <span class="tick-label">step 1 / 5</span>
+    </div>
+</div>
+
+<!-- ===================================================================== -->
+<h2>5. Kernel 3 — output</h2>
+
+<p>
+    Same shape as Kernel 1, but now we walk over <em>j</em> inside the thread
+    instead of <em>e</em>. One thread = one output element <code>O[i][k]</code>:
+</p>
+
+<div class="code-block">
+<pre data-start-line="134" style="--start-line: 134;"><code><span class="line"><span class="kw">__global__</span> <span class="ty">void</span> <span class="fn">attentionOutputKernel</span>(<span class="kw">const</span> <span class="ty">float</span>* <span class="kw">__restrict__</span> P,</span><span class="line">                                       <span class="kw">const</span> <span class="ty">float</span>* <span class="kw">__restrict__</span> V,</span><span class="line">                                       <span class="ty">float</span>* <span class="kw">__restrict__</span> O,</span><span class="line">                                       <span class="ty">int</span> M, <span class="ty">int</span> N, <span class="ty">int</span> d) {</span><span class="line">    <span class="ty">int</span> k = blockIdx.x * blockDim.x + threadIdx.x;     <span class="cmt">// output-dim index</span></span><span class="line">    <span class="ty">int</span> i = blockIdx.y * blockDim.y + threadIdx.y;     <span class="cmt">// query index</span></span><span class="line">    <span class="kw">if</span> (i &gt;= M || k &gt;= d) <span class="kw">return</span>;</span><span class="line"></span><span class="line">    <span class="ty">float</span> acc = <span class="num">0.0f</span>;</span><span class="line">    <span class="kw">const</span> <span class="ty">float</span>* p = P + i * N;</span><span class="line">    <span class="kw">for</span> (<span class="ty">int</span> j = <span class="num">0</span>; j &lt; N; j++) acc += p[j] * V[j * d + k];</span><span class="line">    O[i * d + k] = acc;</span><span class="line">}</span></code></pre>
+</div>
+
+<p>
+    Two big DRAM traversals here:
+</p>
+
+<ul>
+    <li><strong>P:</strong> the whole row of softmaxed probabilities — same one
+        for every <em>k</em> within a warp, so it broadcasts.</li>
+    <li><strong>V:</strong> we read every row of V × N entries. Over the whole
+        kernel, V is read M times (once per query row).</li>
+</ul>
+
+<!-- ===================================================================== -->
+<h2>6. The bandwidth disaster, drawn</h2>
+
+<p>
+    Look at every byte that crosses the DRAM bus during one attention call.
+    For M = N = 512, d = 64, scores is <strong>1 MB</strong> (262,144 × 4 B).
+</p>
+
+<div class="figure" id="fig-attn-bw">
+    <svg viewBox="0 0 720 380" preserveAspectRatio="xMidYMid meet">
+        <text x="360" y="22" text-anchor="middle" class="svg-title">Scores buffer [M × N] · DRAM round-trips</text>
+
+        <rect id="scoresBox" x="280" y="50" width="160" height="160" rx="6"
+              fill="#ffebe9" stroke="#cf222e"/>
+        <text x="360" y="135" text-anchor="middle" class="svg-lbl" id="scoresLbl">scores [512 × 512] · 1 MB</text>
+
+        <!-- arrow zones to/from scoresBox -->
+        <g id="attBwArrows"></g>
+
+        <text x="360" y="265" text-anchor="middle" class="svg-dim" id="bwStatus">click Step ▸ to add each phase's DRAM traffic</text>
+        <text x="360" y="290" text-anchor="middle" class="svg-dim" id="bwTotal">running total: 0 MB</text>
+    </svg>
+    <div class="caption" id="bwCap">Three kernels, three trips through DRAM for the scores buffer.</div>
+    <div class="controls">
+        <button data-act="prev">◂ Prev</button>
+        <button data-act="step">Step ▸</button>
+        <button data-act="reset">↺ Reset</button>
+        <span class="tick-label">step 1 / 5</span>
+    </div>
+</div>
+
+<div class="callout good">
+    <strong>The fix: don't materialize the [M × N] matrix.</strong>
+    Fuse all three kernels into <em>one</em>. Each CTA owns one query row,
+    walks across all N keys once, and keeps three running scalars in registers
+    instead of writing the scores buffer:
+    <ul style="margin: 0.4rem 0 0.4rem 1.2rem;">
+        <li><code>m</code> — running max of scores seen so far</li>
+        <li><code>l</code> — running denominator <code>Σ exp(score − m)</code></li>
+        <li><code>acc</code> — running output <code>Σ softmax_weight × V[j]</code></li>
+    </ul>
+    When a new key has a bigger score, both <code>l</code> and <code>acc</code> get rescaled
+    by <code>exp(m_old − m_new)</code> in a single multiply — provably equivalent to the
+    "real" softmax. After N keys, write <code>O[i] = acc / l</code>.
+    <br><br>
+    The trade: K and V get re-read once per query (slightly more DRAM traffic on those
+    tensors) in exchange for eliminating <em>all 4 MB</em> of scores-buffer round-trips.
+    Walk through it on the <a href="flash_attention.html">flash attention page →</a>
+</div>
+
+<p class="small dim">
+    Two further optimizations production versions stack on top of flash attention:
+    <strong>tile multiple queries per CTA</strong> (so K and V are re-used across the tile,
+    eliminating the "re-read per query" cost) and <strong>tensor cores</strong> for the
+    dot product (not on this card — the 1660 Super has none — but on RTX 30xx+ that's
+    where the headline FLOPS speedup comes from).
+</p>
+
+<!-- ===================================================================== -->
+<h2>7. Memory-hierarchy story</h2>
+
+<table>
+<tr><th>Kernel</th><th>DRAM reads</th><th>DRAM writes</th><th>Shared mem</th></tr>
+<tr><td>scores</td><td>Q (broadcast in warps), K (uncoalesced, M × N × d / 32 transactions)</td><td>scores [M × N]</td><td>—</td></tr>
+<tr><td>softmaxRows</td><td>scores [M × N], 3 passes (mostly L2)</td><td>scores [M × N] (in place)</td><td>256 floats per CTA</td></tr>
+<tr><td>output</td><td>P [M × N], V [N × d]</td><td>O [M × d]</td><td>—</td></tr>
+</table>
+
+<p>
+    The <strong>[M × N] scores matrix is the bandwidth villain</strong>.
+    Even though softmax re-reads it from L2 instead of DRAM (it fits when small),
+    the write from kernel 1 and the read by kernel 3 both go through DRAM.
+    For M=N=4096 (a realistic attention head), <em>scores</em> is 64 MB —
+    blows L2 (1.5 MB) completely, every kernel pays the full DRAM round trip.
+</p>
+
+<!-- ===================================================================== -->
+<h2>8. Why this design exists at all</h2>
+
+<p>
+    It's the textbook decomposition. Each piece maps cleanly to a kernel,
+    each kernel is easy to verify, debugging is straightforward. The cost is
+    the materialized middle matrix.
+</p>
+
+<p>
+    For small attention heads (this test case fits comfortably in L2) it's
+    competitive. For real transformer workloads (seq_len 2048+) it falls off
+    a cliff because <em>scores</em> stops fitting in any cache.
+</p>
+
+<!-- ===================================================================== -->
+<h2>9. Pitfalls</h2>
+
+<ul>
+    <li><strong>Forgetting the scale factor</strong> — without
+        <code>/ sqrt(d)</code> the softmax saturates to a one-hot for large d.</li>
+    <li><strong>Numerical instability without max-trick</strong> —
+        kernel 2 does it correctly (line 104, 117).</li>
+    <li><strong>K accessed row-by-row</strong> in kernel 1 with stride <em>d</em> —
+        if <em>d</em> is small (e.g. 64) and aligned, the inner loop may
+        coalesce within a warp; if <em>d</em> isn't a multiple of 32, the
+        access pattern degrades.</li>
+    <li><strong>Memory blowup</strong> at long sequence: scores grows as N²;
+        at N=8k it's 256 MB — won't even fit in the 6 GB GDDR6, much less L2.</li>
+</ul>
+
+<footer>
+    Next: <a href="flash_attention.html">→ Flash Attention</a> — same math,
+    one kernel, no materialized scores matrix, online softmax over streaming
+    K/V tiles.
+</footer>
+
+</main>
+
+<script>
+class StepFig {
+    constructor(figEl, ticks) {
+        this.fig = figEl; this.ticks = ticks; this.idx = 0;
+        this.cap = figEl.querySelector('.caption');
+        this.tickLabel = figEl.querySelector('.tick-label');
+        this.btnPrev  = figEl.querySelector('[data-act=prev]');
+        this.btnStep  = figEl.querySelector('[data-act=step]');
+        this.btnReset = figEl.querySelector('[data-act=reset]');
+        if (this.btnPrev)  this.btnPrev.addEventListener('click', () => this.prev());
+        if (this.btnStep)  this.btnStep.addEventListener('click', () => this.step());
+        if (this.btnReset) this.btnReset.addEventListener('click', () => this.reset());
+        this.render();
+    }
+    render() {
+        this.ticks[this.idx].apply();
+        if (this.cap) this.cap.textContent = this.ticks[this.idx].caption;
+        if (this.tickLabel) this.tickLabel.textContent = `step ${this.idx + 1} / ${this.ticks.length}`;
+        if (this.btnPrev) this.btnPrev.disabled = (this.idx === 0);
+        if (this.btnStep) this.btnStep.disabled = (this.idx === this.ticks.length - 1);
+    }
+    step()  { if (this.idx < this.ticks.length - 1) { this.idx++; this.render(); } }
+    prev()  { if (this.idx > 0) { this.idx--; this.render(); } }
+    reset() { this.idx = 0; this.render(); }
+}
+const NS = 'http://www.w3.org/2000/svg';
+function mk(tag, attrs = {}, parent = null) {
+    const el = document.createElementNS(NS, tag);
+    for (const k in attrs) el.setAttribute(k, attrs[k]);
+    if (parent) parent.appendChild(el);
+    return el;
+}
+
+// ===================================================================
+// Figure: row-wise softmax on a small scores matrix
+// ===================================================================
+(function () {
+    const fig = document.getElementById('fig-attn-sm');
+    const ROWS = 6, COLS = 10;
+    const cw = 56, ch = 32;
+    const root = fig.querySelector('#asmM');
+    const status = fig.querySelector('#asmStatus');
+    const status2 = fig.querySelector('#asmStatus2');
+    const title = fig.querySelector('#asmT');
+
+    const cells = [];
+    for (let r = 0; r < ROWS; r++) {
+        const row = [];
+        for (let c = 0; c < COLS; c++) {
+            row.push(mk('rect', { x: c*cw, y: r*ch, width: cw-3, height: ch-3, rx: 3,
+                fill: '#ffebe9', stroke: '#cf222e' }, root));
+        }
+        cells.push(row);
+    }
+    function paint(fn) {
+        for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++)
+            cells[r][c].setAttribute('fill', fn(r, c));
+    }
+    const RED = '#ffebe9';
+    const HOT = '#7fd296';
+    const REDUCED = '#f0a070';
+    const NORM = '#cae8ff';
+
+    const ticks = [
+        { caption: 'Scores matrix sits in DRAM. The kernel launches M CTAs — one per row — that all run in parallel. We\'ll walk through CTA 2 as a representative; the others do exactly the same thing on their own rows simultaneously.',
+          apply: () => { title.textContent = 'Scores [M × N] — M CTAs, one per row, all running in parallel';
+              paint(() => RED);
+              status.textContent = 'we focus on row 2; rows 0, 1, 3, 4, 5 each have their own CTA running in lockstep with this one';
+              status2.textContent = ''; } },
+        { caption: 'CTA 2 · phase 1 — scan row 2 and find its max via a tree reduction in shared memory.',
+          apply: () => { title.textContent = 'Phase 1 — row max (CTA 2 shown · all M CTAs doing the same on their row)';
+              paint((r,c) => r === 2 ? HOT : RED);
+              status.textContent = '256 threads scan the row, fmaxf into shared memory';
+              status2.textContent = 'tree reduction collapses to buf[0] = row_max'; } },
+        { caption: 'CTA 2 · phase 2 — each entry becomes exp(score − row_max). Sum is reduced in shared memory.',
+          apply: () => { title.textContent = 'Phase 2 — exp + row sum';
+              paint((r,c) => r === 2 ? REDUCED : RED);
+              status.textContent = 'in-place: scores[2][j] = expf(scores[2][j] − row_max)';
+              status2.textContent = 'second tree reduction → row_sum'; } },
+        { caption: 'CTA 2 · phase 3 — divide every entry by row_sum. Row 2 now sums to 1.0 and CTA 2 retires.',
+          apply: () => { title.textContent = 'Phase 3 — normalize · CTA 2 retires';
+              paint((r,c) => r === 2 ? NORM : RED);
+              status.textContent = 'scores[2][j] *= 1.0 / row_sum';
+              status2.textContent = 'row 2 is now P[2]'; } },
+        { caption: 'The other M−1 CTAs were running phases 1–3 on their own rows the whole time. When the slowest CTA retires, the kernel ends — the whole scores matrix has been replaced with P.',
+          apply: () => { title.textContent = 'All M CTAs retire (in parallel, not in sequence) — scores is now P';
+              paint(() => NORM);
+              status.textContent = 'kernel boundary = global barrier · kernel 3 reads P from DRAM/L2 next';
+              status2.textContent = ''; } },
+    ];
+    new StepFig(fig, ticks);
+})();
+
+// ===================================================================
+// Figure: DRAM bandwidth accounting
+// ===================================================================
+(function () {
+    const fig = document.getElementById('fig-attn-bw');
+    const arrG = fig.querySelector('#attBwArrows');
+    const status = fig.querySelector('#bwStatus');
+    const total = fig.querySelector('#bwTotal');
+
+    function clear() { while (arrG.firstChild) arrG.removeChild(arrG.firstChild); }
+    function addArrow(d, color, label, ly) {
+        mk('path', { d, stroke: color, 'stroke-width': 3, fill: 'none', 'marker-end': 'url(#bw-arr)' }, arrG);
+        if (label) mk('text', { x: 360, y: ly, 'text-anchor': 'middle', class: 'svg-lbl', fill: color }, arrG).textContent = label;
+    }
+    // ensure marker exists once
+    function ensureMarker() {
+        if (!arrG.querySelector('defs')) {
+            const defs = mk('defs', {}, arrG);
+            const m = mk('marker', { id: 'bw-arr', markerWidth: 10, markerHeight: 10, refX: 9, refY: 3, orient: 'auto' }, defs);
+            mk('path', { d: 'M0,0 L0,6 L9,3 z', fill: '#0969da' }, m);
+        }
+    }
+
+    function set(arrows, statusText, runningMB) {
+        clear();
+        ensureMarker();
+        arrows.forEach(a => addArrow(a.d, a.color, a.label, a.ly));
+        status.textContent = statusText;
+        total.textContent = `running DRAM total for the scores buffer: ${runningMB} MB`;
+    }
+    const ticks = [
+        { caption: 'Before kernel 1 runs, the scores buffer is just empty DRAM. No traffic yet.',
+          apply: () => set([], 'idle · no kernels launched', 0) },
+        { caption: 'Kernel 1 writes the scores matrix to DRAM. 1 MB out.',
+          apply: () => set([
+            { d: 'M 100 290 Q 200 200 280 130', color: '#cf222e', label: 'kernel 1 writes 1 MB', ly: 60 }
+          ], 'attentionScoresKernel: writes scores[M·N] → DRAM', 1) },
+        { caption: 'Kernel 2 reads scores from DRAM (mostly L2 for small N, DRAM for large) and writes back in-place. 1 MB read + 1 MB write.',
+          apply: () => set([
+            { d: 'M 280 130 Q 200 60 100 60', color: '#bf8700', label: 'kernel 2 reads 1 MB', ly: 45 },
+            { d: 'M 100 290 Q 200 220 280 200', color: '#bf8700', label: 'kernel 2 writes 1 MB (in-place)', ly: 250 },
+          ], 'softmaxRowsKernel: in-place, but still 1 MB in + 1 MB out of DRAM/L2', 3) },
+        { caption: 'Kernel 3 reads the now-softmaxed scores again. Another 1 MB through the bus.',
+          apply: () => set([
+            { d: 'M 440 130 Q 540 60 640 60', color: '#1a7f37', label: 'kernel 3 reads 1 MB', ly: 45 }
+          ], 'attentionOutputKernel: reads P[M·N] for the P·V multiply', 4) },
+        { caption: '4 MB of DRAM traffic just for the intermediate matrix. Flash attention\'s entire point is to make this number zero.',
+          apply: () => set([
+            { d: 'M 100 290 Q 200 200 280 130', color: '#cf222e', label: 'k1 W 1 MB', ly: 60 },
+            { d: 'M 280 130 Q 200 60 100 60', color: '#bf8700', label: 'k2 R 1 MB', ly: 45 },
+            { d: 'M 440 130 Q 540 60 640 60', color: '#1a7f37', label: 'k3 R 1 MB', ly: 70 },
+          ], 'flash attention will eliminate ALL three of these arrows', 4) },
+    ];
+    new StepFig(fig, ticks);
+})();
+</script>
+</body>
+</html>

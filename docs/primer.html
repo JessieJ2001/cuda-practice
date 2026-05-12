@@ -1,0 +1,670 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>GPU 101 Primer — LeetGPU</title>
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+
+<nav class="topnav">
+    <span class="brand">leetgpu/</span>
+    <a href="index.html">index</a>
+    <a href="primer.html">primer</a>
+    <a href="transpose.html">transpose</a>
+    <span class="spacer"></span>
+    <span class="dim">target: GTX 1660 Super</span>
+</nav>
+
+<main>
+
+<h1>GPU 101 — A Primer Built for Zero Background</h1>
+<p class="dim">
+    Read this once and the rest of the site will make sense. Every section here is
+    referenced by the kernel pages, so it's fine to skim now and come back.
+</p>
+
+<div class="callout">
+    <strong>How the diagrams work:</strong> every figure is step-by-step. Click
+    <code>Step ▸</code> to advance to the next state, <code>◂ Prev</code> to go back,
+    <code>↺ Reset</code> to start over. Nothing animates automatically.
+</div>
+
+
+<h2>1. The hardware we're targeting — GTX 1660 Super</h2>
+
+<p>
+    Every optimization choice on this site is grounded in <em>these</em> numbers.
+    No generalities — real silicon, real bandwidth.
+</p>
+
+<table>
+<tr><th>Spec</th><th>Value</th><th>What it means in practice</th></tr>
+<tr><td>Architecture</td><td>Turing TU116</td><td>2019 chip, no tensor cores, no ray cores.</td></tr>
+<tr><td>SMs</td><td class="mono">22</td><td>22 independent "mini-processors" on the chip.</td></tr>
+<tr><td>CUDA cores</td><td class="mono">1408</td><td>= 22 SMs × 64 FP32 cores. Each core does ~1 FP32 op/cycle.</td></tr>
+<tr><td>Boost clock</td><td class="mono">~1.8 GHz</td><td>Peak FP32 ≈ 5.0 TFLOPS.</td></tr>
+<tr><td>DRAM</td><td class="mono">6 GB GDDR6</td><td>Where all your input tensors start out.</td></tr>
+<tr><td>DRAM bandwidth</td><td class="mono">336 GB/s</td><td>The hard ceiling for memory-bound kernels. <em>Memorize this number.</em></td></tr>
+<tr><td>L2 cache</td><td class="mono">1.5 MB</td><td>Shared by all 22 SMs. ~10× faster than DRAM.</td></tr>
+<tr><td>L1 / shared memory</td><td class="mono">96 KB / SM</td><td>Per-SM, split between L1 cache and programmer-managed scratchpad ("shared memory" / SRAM).</td></tr>
+<tr><td>Registers</td><td class="mono">~64K × 32-bit / SM</td><td>The fastest storage. Per-thread.</td></tr>
+<tr><td><strong>L3 cache</strong></td><td><strong>none</strong></td><td>GPUs don't have an L3 like CPUs. The hierarchy stops at L2.</td></tr>
+</table>
+
+<div class="callout warn">
+    <strong>Heads up:</strong> some recent NVIDIA chips (Hopper, Ada datacenter parts)
+    have additional cache levels. The 1660 Super does <em>not</em>. Your mental
+    model only needs: <code>registers → L1/shared → L2 → DRAM</code>.
+</div>
+
+<!-- ===================================================================== -->
+<h2>2. The memory hierarchy, to scale</h2>
+
+<p>
+    Imagine each byte you touch lives somewhere on this pyramid. The higher up,
+    the faster — and the smaller. The whole game of GPU programming is
+    <strong>moving the right bytes up the pyramid at the right time.</strong>
+</p>
+
+<div class="figure" id="fig-mem">
+    <svg viewBox="0 0 720 380" preserveAspectRatio="xMidYMid meet" aria-label="GPU memory hierarchy">
+        <g id="memHier">
+            <!-- Register layer (top) -->
+            <polygon points="320,20 400,20 440,80 280,80" fill="#dafbe1" stroke="#1a7f37" />
+            <text x="360" y="50" text-anchor="middle" class="svg-title">Registers</text>
+            <text x="360" y="68" text-anchor="middle" class="svg-dim">~1 cycle · per-thread · 64K×32b per SM</text>
+
+            <!-- L1 / shared -->
+            <polygon points="280,80 440,80 480,150 240,150" fill="#fff8c5" stroke="#9a6700" />
+            <text x="360" y="110" text-anchor="middle" class="svg-title">L1 / Shared (SRAM)</text>
+            <text x="360" y="128" text-anchor="middle" class="svg-dim">~1–4 cycles · per-SM · 96 KB</text>
+
+            <!-- L2 -->
+            <polygon points="240,150 480,150 540,240 180,240" fill="#fff1cf" stroke="#bf8700" />
+            <text x="360" y="190" text-anchor="middle" class="svg-title">L2 cache</text>
+            <text x="360" y="208" text-anchor="middle" class="svg-dim">~200 cycles · chip-wide · 1.5 MB total</text>
+
+            <!-- DRAM (bottom) -->
+            <polygon points="180,240 540,240 640,360 80,360" fill="#ffebe9" stroke="#cf222e" />
+            <text x="360" y="290" text-anchor="middle" class="svg-title">DRAM (GDDR6)</text>
+            <text x="360" y="310" text-anchor="middle" class="svg-dim">~500 cycles · off-chip · 6 GB · 336 GB/s</text>
+            <text x="360" y="328" text-anchor="middle" class="svg-dim">↑ everything starts here ↑</text>
+        </g>
+
+        <!-- Side annotations -->
+        <text x="660" y="50"  class="svg-dim" text-anchor="end">fastest</text>
+        <text x="660" y="350" class="svg-dim" text-anchor="end">slowest</text>
+        <text x="660" y="65"  class="svg-dim" text-anchor="end">smallest</text>
+        <text x="660" y="335" class="svg-dim" text-anchor="end">biggest</text>
+
+        <!-- Moving "byte" packet -->
+        <g id="bytePacket" opacity="0">
+            <circle r="11" fill="#0969da" />
+            <text dy="3.5" text-anchor="middle" class="svg-lbl" fill="#fff" font-weight="700">B</text>
+        </g>
+        <text id="byteLabel" x="60" y="22" class="svg-lbl" fill="#0969da">a byte's journey…</text>
+    </svg>
+    <div class="caption" id="cap-mem">Click <strong>Step ▸</strong> to walk one byte from DRAM up to a register.</div>
+    <div class="controls">
+        <button data-act="prev">◂ Prev</button>
+        <button data-act="step">Step ▸</button>
+        <button data-act="reset">↺ Reset</button>
+        <span class="tick-label">step 1 / 5</span>
+    </div>
+</div>
+
+<p class="dim small">
+    The latencies above are approximate — the real numbers vary with contention —
+    but the <em>order of magnitude</em> gap is what matters. Touching DRAM costs
+    roughly <strong>500× more cycles</strong> than touching a register.
+</p>
+
+<!-- ===================================================================== -->
+<h2>3. How threads are organized — grid, CTA, warp, thread</h2>
+
+<p>
+    When you launch a CUDA kernel with <code>kernel&lt;&lt;&lt;gridDim, blockDim&gt;&gt;&gt;(…)</code>,
+    you're saying: <em>"run this function this many times, in parallel."</em> The threads
+    are grouped into a four-level hierarchy:
+</p>
+
+<table>
+<tr><th>Level</th><th>What it is</th><th>Typical size</th></tr>
+<tr><td><strong>Grid</strong></td><td>All threads in one kernel launch.</td><td>Thousands to millions</td></tr>
+<tr><td><strong>CTA</strong> (Cooperative Thread Array, a.k.a. <em>block</em>)</td><td>A group of threads that run together on one SM and can share memory.</td><td>Up to 1024 threads</td></tr>
+<tr><td><strong>Warp</strong></td><td>32 threads inside a CTA that execute the <em>same</em> instruction at the <em>same</em> time.</td><td>Always 32</td></tr>
+<tr><td><strong>Thread</strong></td><td>One stream of instructions, owns its own registers.</td><td>1</td></tr>
+</table>
+
+<div class="figure" id="fig-grid">
+    <svg viewBox="0 0 720 360" preserveAspectRatio="xMidYMid meet">
+        <g id="gridView">
+            <text x="120" y="25" text-anchor="middle" class="svg-title">Grid (all blocks)</text>
+            <g id="gridBlocks"></g>
+        </g>
+
+        <g id="ctaView">
+            <text x="380" y="25" text-anchor="middle" class="svg-title">One CTA (zoomed)</text>
+            <g id="ctaThreads"></g>
+        </g>
+
+        <g id="warpView">
+            <text x="610" y="25" text-anchor="middle" class="svg-title">One warp (32 threads)</text>
+            <g id="warpLane"></g>
+            <text x="610" y="200" text-anchor="middle" class="svg-dim" id="warpInstr">idle</text>
+        </g>
+    </svg>
+    <div class="caption" id="cap-grid">A kernel launch is a grid of CTAs. Each CTA contains warps. Each warp contains 32 threads.</div>
+    <div class="controls">
+        <button data-act="prev">◂ Prev</button>
+        <button data-act="step">Step ▸</button>
+        <button data-act="reset">↺ Reset</button>
+        <span class="tick-label">step 1 / 5</span>
+    </div>
+</div>
+
+<h3>Why this matters</h3>
+<ul>
+    <li><strong>A CTA never splits across SMs.</strong> All its threads live together — they can share fast SRAM and synchronize with <code>__syncthreads()</code>.</li>
+    <li><strong>A warp is the real unit of execution.</strong> The hardware schedules <em>warps</em>, not individual threads. When you call a kernel, what actually runs is "warp 0 issues an instruction; warp 1 issues an instruction; …" — 32 threads at a time.</li>
+    <li><strong>Threads inside a warp run in lockstep.</strong> They all execute the same instruction on the same cycle. If 31 are doing useful work and 1 is idle, the warp still takes one cycle.</li>
+</ul>
+
+<!-- ===================================================================== -->
+<h2>4. The SM (Streaming Multiprocessor)</h2>
+
+<p>
+    An SM is one of the 22 "mini-processors" on the chip. Think of it as a tiny
+    multicore CPU with its own private cache.
+</p>
+
+<div class="figure">
+    <svg viewBox="0 0 720 320" preserveAspectRatio="xMidYMid meet">
+        <rect x="20" y="20" width="680" height="280" fill="#ffffff" stroke="#d0d7de" rx="10" />
+        <text x="360" y="46" text-anchor="middle" class="svg-title">One Streaming Multiprocessor (×22 on the chip)</text>
+
+        <!-- CUDA cores -->
+        <rect x="40" y="65" width="430" height="80" fill="#dafbe1" stroke="#1a7f37" rx="6" />
+        <text x="255" y="86" text-anchor="middle" class="svg-lbl" fill="#1a7f37">64 CUDA cores (FP32 ALUs)</text>
+
+        <!-- Warp schedulers -->
+        <rect x="490" y="65" width="190" height="80" fill="#fbefff" stroke="#8250df" rx="6" />
+        <text x="585" y="86" text-anchor="middle" class="svg-lbl" fill="#8250df">4 warp schedulers</text>
+        <text x="585" y="106" text-anchor="middle" class="svg-dim">pick a ready warp,</text>
+        <text x="585" y="120" text-anchor="middle" class="svg-dim">issue one instruction</text>
+
+        <!-- Registers -->
+        <rect x="40" y="165" width="200" height="60" fill="#dafbe1" stroke="#1a7f37" rx="6" />
+        <text x="140" y="186" text-anchor="middle" class="svg-lbl" fill="#1a7f37">Register file</text>
+        <text x="140" y="206" text-anchor="middle" class="svg-dim">~256 KB, sliced per thread</text>
+
+        <!-- L1 / shared -->
+        <rect x="260" y="165" width="200" height="60" fill="#fff8c5" stroke="#9a6700" rx="6" />
+        <text x="360" y="186" text-anchor="middle" class="svg-lbl" fill="#9a6700">L1 / shared</text>
+        <text x="360" y="206" text-anchor="middle" class="svg-dim">96 KB, configurable split</text>
+
+        <!-- LD/ST units -->
+        <rect x="480" y="165" width="200" height="60" fill="#fff1cf" stroke="#bf8700" rx="6" />
+        <text x="580" y="186" text-anchor="middle" class="svg-lbl" fill="#bf8700">Load / store units</text>
+        <text x="580" y="206" text-anchor="middle" class="svg-dim">talk to L2 + DRAM</text>
+
+        <text x="360" y="270" text-anchor="middle" class="svg-dim">
+            multiple CTAs (each = up to 1024 threads = up to 32 warps) live on one SM at once
+        </text>
+    </svg>
+    <div class="caption">Inside one SM. The 22 of these on the chip work fully independently.</div>
+</div>
+
+<p>
+    Each SM picks a <strong>ready warp</strong> every cycle and issues one instruction to all 32 of its threads.
+    When a warp stalls (waiting on a slow DRAM load, say), the scheduler instantly switches to another warp
+    that <em>is</em> ready. With enough warps in flight per SM, the GPU hides the 500-cycle DRAM latency
+    completely — this is called <strong>latency hiding</strong>, and it's why GPUs care less about caches
+    than CPUs do.
+</p>
+
+<!-- ===================================================================== -->
+<h2>6. Warps and SIMT — one instruction, 32 threads</h2>
+
+<p>
+    SIMT = "Single Instruction, Multiple Threads". The hardware fetches one instruction
+    and broadcasts it to 32 threads. Each thread executes that instruction on its own
+    data, in its own registers. As long as all 32 threads want to do the same thing,
+    everyone wins.
+</p>
+
+<p>
+    The catch is <strong>divergence</strong>. If your code has an <code>if</code> that
+    sends some threads down one branch and others down a different branch, the warp
+    has to execute <em>both</em> branches serially, masking off the threads that
+    aren't participating. A heavy <code>if/else</code> inside a hot loop can halve
+    your throughput.
+</p>
+
+<!-- ===================================================================== -->
+<h2>7. Memory coalescing — the single most important optimization</h2>
+
+<p>
+    When a warp issues a load, the hardware tries to pack all 32 reads into <em>as
+    few DRAM transactions as possible</em>. The rule of thumb:
+</p>
+
+<div class="callout good">
+    If 32 threads in a warp read 32 <strong>consecutive</strong> 4-byte values starting
+    at an aligned address, that's <strong>one</strong> 128-byte transaction.
+</div>
+
+<div class="callout bad">
+    If those 32 threads read 32 values <strong>scattered</strong> around DRAM,
+    the hardware has to issue <strong>up to 32 separate transactions</strong> — about
+    32× the bandwidth cost.
+</div>
+
+<p>
+    On a 336 GB/s memory bus, that's the difference between a kernel that runs at full
+    speed and one that's 32× slower. The figure below makes it concrete.
+</p>
+
+<div class="figure" id="fig-coalesce">
+    <svg viewBox="0 0 720 380" preserveAspectRatio="xMidYMid meet">
+        <text x="180" y="20" text-anchor="middle" class="svg-title">Coalesced (consecutive)</text>
+        <text x="540" y="20" text-anchor="middle" class="svg-title">Strided (every 8th)</text>
+
+        <g id="coalLeft">
+            <g id="coalThreads" transform="translate(40,40)"></g>
+            <g id="coalArrows" transform="translate(40,90)"></g>
+            <g id="coalDram" transform="translate(40,180)"></g>
+            <g id="coalBadge" transform="translate(180,260)" opacity="0">
+                <rect x="-72" y="-18" width="144" height="32" rx="6" fill="#dafbe1" stroke="#1a7f37" />
+                <text x="0" y="3" text-anchor="middle" class="svg-lbl" fill="#1a7f37">1 transaction</text>
+            </g>
+            <text x="180" y="320" text-anchor="middle" class="svg-dim" id="coalCost">cost: —</text>
+        </g>
+
+        <line x1="360" y1="30" x2="360" y2="370" stroke="#d0d7de" stroke-dasharray="4 4" />
+
+        <g id="coalRight">
+            <g id="strThreads" transform="translate(400,40)"></g>
+            <g id="strArrows" transform="translate(400,90)"></g>
+            <g id="strDram" transform="translate(400,180)"></g>
+            <g id="strBadge" transform="translate(540,260)" opacity="0">
+                <rect x="-82" y="-18" width="164" height="32" rx="6" fill="#ffebe9" stroke="#cf222e" />
+                <text x="0" y="3" text-anchor="middle" class="svg-lbl" fill="#cf222e">8 transactions</text>
+            </g>
+            <text x="540" y="320" text-anchor="middle" class="svg-dim" id="strCost">cost: —</text>
+        </g>
+
+        <text x="40"  y="160" class="svg-dim">warp (8 of 32 shown)</text>
+        <text x="40"  y="250" class="svg-dim">DRAM cells</text>
+    </svg>
+    <div class="caption" id="cap-coal">Two warps. Same number of bytes. Vastly different cost.</div>
+    <div class="controls">
+        <button data-act="prev">◂ Prev</button>
+        <button data-act="step">Step ▸</button>
+        <button data-act="reset">↺ Reset</button>
+        <span class="tick-label">step 1 / 5</span>
+    </div>
+</div>
+
+<p class="small dim">
+    Diagrams show 8 threads instead of 32 for legibility; the principle is identical at 32.
+    On real hardware the strided case can be up to 32 separate 32-byte sector loads.
+</p>
+
+<!-- ===================================================================== -->
+<h2>8. Shared memory & bank conflicts</h2>
+
+<p>
+    Shared memory (the programmer-managed slice of that 96 KB per-SM SRAM) is fast,
+    but it's split into <strong>32 banks</strong>, each 4 bytes wide and striped across
+    addresses. Bank <em>k</em> holds words <em>k, k+32, k+64, …</em>.
+</p>
+
+<p>
+    A warp can read 32 different banks in one cycle. If two threads in the same warp
+    hit the <em>same</em> bank (different addresses), the hardware serializes them.
+    In the worst case, all 32 threads hit the same bank — a <strong>32-way bank conflict</strong>
+    — and the access takes 32× longer.
+</p>
+
+<div class="figure" id="fig-banks">
+    <svg viewBox="0 0 720 360" preserveAspectRatio="xMidYMid meet">
+        <text x="360" y="22" text-anchor="middle" class="svg-title" id="bankTitle">Conflict-free access</text>
+
+        <text x="40" y="48" class="svg-dim">threads</text>
+        <g id="bankThreads" transform="translate(40,55)"></g>
+
+        <g id="bankArrows" transform="translate(0,110)"></g>
+
+        <text x="40" y="203" class="svg-dim">banks</text>
+        <g id="bankCells" transform="translate(40,210)"></g>
+
+        <text x="360" y="305" text-anchor="middle" class="svg-dim" id="bankCaption">all 8 threads hit different banks → 1 cycle</text>
+    </svg>
+    <div class="caption" id="cap-banks">Step through three scenarios: conflict-free, 8-way conflict, and the "+1 padding" fix.</div>
+    <div class="controls">
+        <button data-act="prev">◂ Prev</button>
+        <button data-act="step">Step ▸</button>
+        <button data-act="reset">↺ Reset</button>
+        <span class="tick-label">step 1 / 4</span>
+    </div>
+</div>
+
+<p>
+    The transpose kernel uses a trick that the rest of this site keeps coming back to:
+    declare the shared-memory tile <strong>one column wider than you need</strong>.
+    That single extra column shifts each row by one bank, breaking the conflict
+    pattern. You'll see it in action on the <a href="transpose.html">transpose page</a>.
+</p>
+
+<!-- ===================================================================== -->
+<h2>9. Glossary</h2>
+
+<table>
+<tr><td class="mono">DRAM</td><td>Off-chip main memory (GDDR6 here). Big, slow, ~336 GB/s on this card.</td></tr>
+<tr><td class="mono">SRAM</td><td>On-chip static RAM. In CUDA-speak this is <em>shared memory</em> plus the L1 cache.</td></tr>
+<tr><td class="mono">L1 / L2</td><td>Hardware caches. L1 is per-SM (shares the 96 KB SRAM); L2 is chip-wide (1.5 MB).</td></tr>
+<tr><td class="mono">Register</td><td>Per-thread fast storage. Single cycle. ~64K 32-bit slots per SM, sliced across resident threads.</td></tr>
+<tr><td class="mono">CUDA core</td><td>One FP32 ALU. 64 per SM × 22 SMs = 1408 on this card.</td></tr>
+<tr><td class="mono">SM</td><td>Streaming Multiprocessor. One of 22 independent "mini-processors" on the chip.</td></tr>
+<tr><td class="mono">CTA / block</td><td>Cooperative Thread Array. A group of threads (up to 1024) that runs on a single SM, can share SRAM, can sync with <code>__syncthreads()</code>.</td></tr>
+<tr><td class="mono">Warp</td><td>32 threads inside a CTA that the hardware schedules together. All 32 execute the same instruction each cycle.</td></tr>
+<tr><td class="mono">Grid</td><td>All the CTAs in a single kernel launch.</td></tr>
+<tr><td class="mono">Coalescing</td><td>Packing the 32 loads of a warp into one DRAM transaction. Achieved by reading consecutive aligned addresses.</td></tr>
+<tr><td class="mono">Bank conflict</td><td>Two threads of a warp hit the same shared-memory bank → serialized.</td></tr>
+<tr><td class="mono">SIMT</td><td>Single Instruction, Multiple Threads — the execution model where one fetched instruction is broadcast to 32 threads.</td></tr>
+</table>
+
+<footer>
+    Next: <a href="transpose.html">→ Matrix Transpose</a> — where every concept above pays off.
+</footer>
+
+</main>
+
+<!-- ===================================================================== -->
+<!-- Step-by-step figure controller. Each tick.apply() sets state fully so   -->
+<!-- stepping backwards just re-applies the chosen tick.                     -->
+<!-- ===================================================================== -->
+<script>
+class StepFig {
+    constructor(figEl, ticks) {
+        this.fig = figEl;
+        this.ticks = ticks;
+        this.idx = 0;
+        this.cap = figEl.querySelector('.caption');
+        this.tickLabel = figEl.querySelector('.tick-label');
+        this.btnPrev  = figEl.querySelector('[data-act=prev]');
+        this.btnStep  = figEl.querySelector('[data-act=step]');
+        this.btnReset = figEl.querySelector('[data-act=reset]');
+        if (this.btnPrev)  this.btnPrev.addEventListener('click', () => this.prev());
+        if (this.btnStep)  this.btnStep.addEventListener('click', () => this.step());
+        if (this.btnReset) this.btnReset.addEventListener('click', () => this.reset());
+        this.render();
+    }
+    render() {
+        this.ticks[this.idx].apply();
+        if (this.cap) this.cap.textContent = this.ticks[this.idx].caption;
+        if (this.tickLabel) this.tickLabel.textContent = `step ${this.idx + 1} / ${this.ticks.length}`;
+        if (this.btnPrev) this.btnPrev.disabled = (this.idx === 0);
+        if (this.btnStep) this.btnStep.disabled = (this.idx === this.ticks.length - 1);
+    }
+    step()  { if (this.idx < this.ticks.length - 1) { this.idx++; this.render(); } }
+    prev()  { if (this.idx > 0) { this.idx--; this.render(); } }
+    reset() { this.idx = 0; this.render(); }
+}
+
+const NS = 'http://www.w3.org/2000/svg';
+function mk(tag, attrs = {}, parent = null) {
+    const el = document.createElementNS(NS, tag);
+    for (const k in attrs) el.setAttribute(k, attrs[k]);
+    if (parent) parent.appendChild(el);
+    return el;
+}
+
+// =======================================================================
+// Figure 1: memory hierarchy — a byte travels up
+// =======================================================================
+(function () {
+    const fig = document.getElementById('fig-mem');
+    const packet = fig.querySelector('#bytePacket');
+    const label  = fig.querySelector('#byteLabel');
+
+    const stops = [
+        { x: 360, y: 300, name: 'DRAM',        color: '#cf222e' },
+        { x: 360, y: 195, name: 'L2',          color: '#bf8700' },
+        { x: 360, y: 115, name: 'L1 / shared', color: '#9a6700' },
+        { x: 360, y: 45,  name: 'register',    color: '#1a7f37' }
+    ];
+    function setStop(i, txt) {
+        packet.setAttribute('opacity', 1);
+        packet.setAttribute('transform', `translate(${stops[i].x},${stops[i].y})`);
+        label.textContent = txt;
+        label.setAttribute('fill', stops[i].color);
+    }
+    const ticks = [
+        { caption: 'A byte sits in DRAM, off-chip. ~500 cycles away.',
+          apply: () => setStop(0, 'now in: DRAM') },
+        { caption: 'The load-store unit fetches it; it lands in L2 (~200 cycles total).',
+          apply: () => setStop(1, 'now in: L2') },
+        { caption: 'L2 → L1: now on the same SM as our warp.',
+          apply: () => setStop(2, 'now in: L1 / shared') },
+        { caption: 'Finally loaded into a register — single-cycle access from here.',
+          apply: () => setStop(3, 'now in: register') },
+        { caption: 'A re-read of the same byte is now nearly free. Reusing data is the whole point of caches.',
+          apply: () => setStop(3, 'reuse → register again') },
+    ];
+    new StepFig(fig, ticks);
+})();
+
+// =======================================================================
+// Figure 2: grid → CTA → warp zoom
+// =======================================================================
+(function () {
+    const fig = document.getElementById('fig-grid');
+    const gridG = fig.querySelector('#gridBlocks');
+    const ctaG  = fig.querySelector('#ctaThreads');
+    const warpG = fig.querySelector('#warpLane');
+    const ctaView  = fig.querySelector('#ctaView');
+    const warpView = fig.querySelector('#warpView');
+    const warpInstr = fig.querySelector('#warpInstr');
+
+    // 4×4 grid of blocks
+    for (let r = 0; r < 4; r++) for (let c = 0; c < 4; c++) {
+        mk('rect', { x: 30 + c * 42, y: 50 + r * 42, width: 38, height: 38,
+            rx: 3, fill: '#fbefff', stroke: '#8250df' }, gridG);
+    }
+    const highlight = mk('rect', {
+        x: 30, y: 50, width: 38, height: 38, rx: 3,
+        fill: 'none', stroke: '#0969da', 'stroke-width': 3, opacity: 0
+    }, gridG);
+
+    // 8×4 thread cells inside one CTA
+    const tCells = [];
+    for (let r = 0; r < 4; r++) for (let c = 0; c < 8; c++) {
+        tCells.push(mk('rect', { x: 290 + c * 22, y: 50 + r * 26, width: 18, height: 22,
+            rx: 2, fill: '#dafbe1', stroke: '#1a7f37' }, ctaG));
+    }
+    const warpHL = mk('rect', {
+        x: 288, y: 48, width: 180, height: 26, rx: 3,
+        fill: 'none', stroke: '#8250df', 'stroke-width': 3, opacity: 0
+    }, ctaG);
+
+    // 8 lane cells
+    const laneCells = [];
+    for (let i = 0; i < 8; i++) {
+        laneCells.push(mk('rect', { x: 555 + i * 14, y: 60, width: 12, height: 30,
+            rx: 2, fill: '#dafbe1', stroke: '#1a7f37' }, warpG));
+        mk('text', { x: 561 + i * 14, y: 110, 'text-anchor': 'middle', class: 'svg-dim' }, warpG)
+            .textContent = (i === 7 ? '…' : i);
+    }
+
+    function setState(s) {
+        highlight.setAttribute('opacity', s.highlight);
+        ctaView.setAttribute('opacity', s.cta);
+        warpView.setAttribute('opacity', s.warp);
+        warpHL.setAttribute('opacity', s.warpHL);
+        laneCells.forEach(c => c.setAttribute('fill', s.lanes));
+        warpInstr.textContent = s.instr;
+    }
+    const DIM = 0.25, ON = 1.0;
+    const defaultLane = '#dafbe1';
+    const ticks = [
+        { caption: 'A kernel launch starts with a whole grid of CTAs. Each square is one CTA.',
+          apply: () => setState({ highlight: 0, cta: DIM, warp: DIM, warpHL: 0, lanes: defaultLane, instr: '' }) },
+        { caption: 'Pick one CTA. All of its threads will run on a single SM, sharing fast SRAM.',
+          apply: () => setState({ highlight: 1, cta: ON,  warp: DIM, warpHL: 0, lanes: defaultLane, instr: '' }) },
+        { caption: 'Inside the CTA, threads are sliced into warps of 32. (Diagram shows 8 per row for space.)',
+          apply: () => setState({ highlight: 1, cta: ON,  warp: ON,  warpHL: 1, lanes: defaultLane, instr: '' }) },
+        { caption: 'The hardware schedules the whole warp at once. Same instruction, 32 threads.',
+          apply: () => setState({ highlight: 1, cta: ON,  warp: ON,  warpHL: 1, lanes: '#a5d6f4', instr: 'LD r0, [addr+lane]' }) },
+        { caption: 'Next cycle, the scheduler may pick a different warp from the same or another CTA. Always 32 lanes wide.',
+          apply: () => setState({ highlight: 1, cta: ON,  warp: ON,  warpHL: 1, lanes: defaultLane, instr: 'ADD r1, r0, r2' }) },
+    ];
+    new StepFig(fig, ticks);
+})();
+
+// =======================================================================
+// Figure 3: coalescing comparison
+// =======================================================================
+(function () {
+    const fig = document.getElementById('fig-coalesce');
+    const N = 8;
+
+    function makeRow(parent, fill, stroke, labels) {
+        for (let i = 0; i < N; i++) {
+            mk('rect', { x: i * 38, y: 0, width: 32, height: 32, rx: 3,
+                fill, stroke }, parent);
+            mk('text', { x: i * 38 + 16, y: 20, 'text-anchor': 'middle', class: 'svg-lbl' }, parent)
+                .textContent = labels[i];
+        }
+    }
+
+    // LEFT
+    const coalThreads = fig.querySelector('#coalThreads');
+    const coalDram    = fig.querySelector('#coalDram');
+    const coalArrows  = fig.querySelector('#coalArrows');
+    const coalBadge   = fig.querySelector('#coalBadge');
+    const coalCost    = fig.querySelector('#coalCost');
+    makeRow(coalThreads, '#dafbe1', '#1a7f37', ['t0','t1','t2','t3','t4','t5','t6','t7']);
+    makeRow(coalDram,    '#ffebe9', '#cf222e', ['0','1','2','3','4','5','6','7']);
+
+    const coalArrEls = [];
+    for (let i = 0; i < N; i++) {
+        const x = i * 38 + 16;
+        coalArrEls.push(mk('line', { x1: x, y1: 0, x2: x, y2: 80,
+            stroke: '#0969da', 'stroke-width': 2, opacity: 0 }, coalArrows));
+    }
+    const fatArrow = mk('rect', { x: 0, y: 36, width: 38 * N - 6, height: 14, rx: 4,
+        fill: '#cce5ff', stroke: '#0969da', opacity: 0 }, coalArrows);
+
+    // RIGHT
+    const strThreads = fig.querySelector('#strThreads');
+    const strDram    = fig.querySelector('#strDram');
+    const strArrows  = fig.querySelector('#strArrows');
+    const strBadge   = fig.querySelector('#strBadge');
+    const strCost    = fig.querySelector('#strCost');
+    makeRow(strThreads, '#dafbe1', '#1a7f37', ['t0','t1','t2','t3','t4','t5','t6','t7']);
+    const strDramCells = [];
+    for (let i = 0; i < N; i++) {
+        strDramCells.push(mk('rect', { x: i * 38, y: 0, width: 32, height: 32, rx: 3,
+            fill: '#ffebe9', stroke: '#cf222e' }, strDram));
+        mk('text', { x: i * 38 + 16, y: 20, 'text-anchor': 'middle', class: 'svg-lbl' }, strDram)
+            .textContent = (i * 8);
+    }
+    const strArrEls = [];
+    for (let i = 0; i < N; i++) {
+        const x = i * 38 + 16;
+        strArrEls.push(mk('line', { x1: x, y1: 0, x2: x, y2: 80,
+            stroke: '#cf222e', 'stroke-width': 2, opacity: 0 }, strArrows));
+    }
+
+    function setAll(coalArrows, fat, badgeL, costL, strArrows, badgeR, costR, hotCells) {
+        coalArrEls.forEach(a => a.setAttribute('opacity', coalArrows));
+        fatArrow.setAttribute('opacity', fat);
+        coalBadge.setAttribute('opacity', badgeL);
+        coalCost.textContent = costL;
+        strArrEls.forEach(a => a.setAttribute('opacity', strArrows));
+        strBadge.setAttribute('opacity', badgeR);
+        strCost.textContent = costR;
+        strDramCells.forEach(c => c.setAttribute('fill', hotCells ? '#ffcec4' : '#ffebe9'));
+    }
+
+    const ticks = [
+        { caption: '8 threads on each side need 8 floats. Same total bytes. Watch what differs.',
+          apply: () => setAll(0, 0, 0, 'cost: —', 0, 0, 'cost: —', false) },
+        { caption: 'Coalesced side: 8 threads issue loads to addresses 0,1,2,…,7. Hardware sees one contiguous run.',
+          apply: () => setAll(0.85, 0, 0, 'cost: pending…', 0, 0, 'cost: —', false) },
+        { caption: 'Coalesced merges into ONE DRAM transaction — 32 bytes pulled together.',
+          apply: () => setAll(0.3, 1, 1, 'cost: 1 transaction · 32 B', 0, 0, 'cost: —', false) },
+        { caption: 'Strided side: thread t_i wants address 8·i. The 8 loads are spread across the chip.',
+          apply: () => setAll(0.3, 1, 1, 'cost: 1 transaction · 32 B', 0.9, 0, 'cost: pending…', false) },
+        { caption: 'Strided fires 8 SEPARATE transactions — 8× the bandwidth cost for the same payload.',
+          apply: () => setAll(0.3, 1, 1, 'cost: 1 transaction · 32 B', 0.9, 1, 'cost: 8 transactions · 256 B fetched', true) },
+    ];
+    new StepFig(fig, ticks);
+})();
+
+// =======================================================================
+// Figure 4: bank conflicts
+// =======================================================================
+(function () {
+    const fig = document.getElementById('fig-banks');
+    const threadsG = fig.querySelector('#bankThreads');
+    const cellsG   = fig.querySelector('#bankCells');
+    const arrowsG  = fig.querySelector('#bankArrows');
+    const title    = fig.querySelector('#bankTitle');
+    const cap      = fig.querySelector('#bankCaption');
+    const N = 8;
+    for (let i = 0; i < N; i++) {
+        mk('rect', { x: i*50, y: 0, width: 40, height: 30, rx: 3,
+            fill: '#dafbe1', stroke: '#1a7f37' }, threadsG);
+        mk('text', { x: i*50 + 20, y: 19, 'text-anchor': 'middle', class: 'svg-lbl' }, threadsG)
+            .textContent = 't' + i;
+        mk('rect', { x: i*50, y: 0, width: 40, height: 30, rx: 3,
+            fill: '#fff8c5', stroke: '#9a6700' }, cellsG);
+        mk('text', { x: i*50 + 20, y: 19, 'text-anchor': 'middle', class: 'svg-lbl' }, cellsG)
+            .textContent = 'b' + i;
+    }
+    const arrows = [];
+    for (let i = 0; i < N; i++)
+        arrows.push(mk('line', { stroke: '#1a7f37', 'stroke-width': 2 }, arrowsG));
+
+    function setArrows(targets, color) {
+        arrows.forEach((a, i) => {
+            const x1 = 40 + i * 50 + 20;
+            const x2 = 40 + targets[i] * 50 + 20;
+            a.setAttribute('x1', x1); a.setAttribute('y1', 30);
+            a.setAttribute('x2', x2); a.setAttribute('y2', 100);
+            a.setAttribute('stroke', color);
+        });
+    }
+
+    const ident   = [0,1,2,3,4,5,6,7];
+    const allZero = [0,0,0,0,0,0,0,0];
+
+    const ticks = [
+        { caption: 'Scenario 1 — 8 threads, each hitting a different bank. The hardware loves this.',
+          apply: () => { title.textContent = '1) Conflict-free access';
+                         setArrows(ident, '#1a7f37');
+                         cap.textContent = '8 distinct banks → 1 cycle. Maximum parallelism.'; } },
+        { caption: 'Scenario 2 — all 8 threads hit bank 0. Hardware must serialize them.',
+          apply: () => { title.textContent = '2) 8-way bank conflict (worst case)';
+                         setArrows(allZero, '#cf222e');
+                         cap.textContent = 'Same bank, 8 different rows → 8 sequential cycles. 8× slowdown.'; } },
+        { caption: 'Scenario 3 — declare the tile [N][N+1] instead of [N][N]. The extra column shifts every row by one bank.',
+          apply: () => { title.textContent = '3) Fixed with one column of padding';
+                         setArrows(ident, '#1a7f37');
+                         cap.textContent = 'Now a column read again touches 8 distinct banks → back to 1 cycle.'; } },
+        { caption: 'That single "+1" is why transpose kernels declare __shared__ float tile[N][N+1].',
+          apply: () => { title.textContent = 'Punchline → see transpose.cu:35';
+                         setArrows(ident, '#1a7f37');
+                         cap.textContent = '4 bytes of wasted memory, 8× faster shared-memory transpose.'; } },
+    ];
+    new StepFig(fig, ticks);
+})();
+</script>
+
+</body>
+</html>

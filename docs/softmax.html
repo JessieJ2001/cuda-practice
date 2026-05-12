@@ -1,0 +1,491 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Softmax — LeetGPU</title>
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+
+<nav class="topnav">
+    <span class="brand">leetgpu/</span>
+    <a href="index.html">index</a>
+    <a href="primer.html">primer</a>
+    <a href="transpose.html">transpose</a>
+    <a href="vector_addition.html">vector_addition</a>
+    <a href="softmax.html">softmax</a>
+    <span class="spacer"></span>
+    <span class="dim">target: GTX 1660 Super</span>
+</nav>
+
+<main>
+
+<h1>Softmax</h1>
+
+<div class="callout">
+    <strong>TL;DR.</strong> Softmax forces you to compute two
+    <em>global</em> values across the whole array (max and sum-of-exp) before
+    any output can be written. CTAs can't talk to each other mid-kernel, so the
+    work is split into <strong>three kernel launches</strong>. Inside each
+    kernel, threads cooperate via a <em>tree reduction in shared memory</em>,
+    then one thread per CTA <em>atomically adds</em> the block result to a global
+    scalar. The numerical-stability trick (subtract the max) keeps
+    <code>exp()</code> from overflowing.
+</div>
+
+<p class="small dim">
+    Source: <a href="../softmax.cu">/workspaces/leetgpu-master/softmax.cu</a>.
+</p>
+
+<div class="legend">
+    <span><span class="swatch" style="background:#ffebe9;border-color:#cf222e"></span>DRAM</span>
+    <span><span class="swatch" style="background:#fff1cf;border-color:#bf8700"></span>L2</span>
+    <span><span class="swatch" style="background:#fff8c5;border-color:#9a6700"></span>L1 / shared</span>
+    <span><span class="swatch" style="background:#dafbe1;border-color:#1a7f37"></span>register</span>
+    <span><span class="swatch" style="background:#fbefff;border-color:#8250df"></span>warp</span>
+</div>
+
+<!-- ===================================================================== -->
+<h2>1. The problem</h2>
+
+<p>
+    Given a vector <code>x</code> of length <em>N</em>, softmax produces a
+    probability vector <em>p</em> where:
+</p>
+
+<pre><code>p[i] = exp(x[i] - max(x)) / Σ exp(x[j] - max(x))     // numerically stable form</code></pre>
+
+<p>
+    Three things to notice:
+</p>
+
+<ol>
+    <li>You need <code>max(x)</code> before you can start <code>exp</code>.</li>
+    <li>You need <code>Σ exp(...)</code> before you can divide.</li>
+    <li>The subtraction by <code>max</code> isn't math — it's defensive:
+        without it, <code>exp(50)</code> overflows to <code>+inf</code> and your
+        output becomes <code>nan</code>.</li>
+</ol>
+
+<!-- ===================================================================== -->
+<h2>2. Why three kernels?</h2>
+
+<p>
+    Here's the constraint that shapes the entire design:
+    <strong>CTAs on different SMs cannot synchronize during a kernel</strong>.
+    There's no <code>__syncthreads()</code> across blocks. The only way to wait
+    for all CTAs to finish a phase is to <em>end the kernel</em> — the next
+    kernel launch is the global barrier.
+</p>
+
+<p>
+    Softmax has two such phases (compute max, compute sum), so we get three
+    kernels:
+</p>
+
+<div class="figure">
+    <svg viewBox="0 0 720 220" preserveAspectRatio="xMidYMid meet">
+        <rect x="20"  y="40" width="200" height="120" rx="10" fill="#fbefff" stroke="#8250df"/>
+        <text x="120" y="70" text-anchor="middle" class="svg-title">1) findMaxKernel</text>
+        <text x="120" y="92" text-anchor="middle" class="svg-dim">reduce → max(x)</text>
+        <text x="120" y="110" text-anchor="middle" class="svg-dim">output: d_max[0]</text>
+        <text x="120" y="130" text-anchor="middle" class="svg-dim">softmax.cu:114</text>
+
+        <rect x="260" y="40" width="200" height="120" rx="10" fill="#dafbe1" stroke="#1a7f37"/>
+        <text x="360" y="70" text-anchor="middle" class="svg-title">2) softmaxPartial</text>
+        <text x="360" y="92" text-anchor="middle" class="svg-dim">Σ exp(x − max)</text>
+        <text x="360" y="110" text-anchor="middle" class="svg-dim">output: d_sum[0]</text>
+        <text x="360" y="130" text-anchor="middle" class="svg-dim">softmax.cu:39</text>
+
+        <rect x="500" y="40" width="200" height="120" rx="10" fill="#fff1cf" stroke="#bf8700"/>
+        <text x="600" y="70" text-anchor="middle" class="svg-title">3) softmaxNormalize</text>
+        <text x="600" y="92" text-anchor="middle" class="svg-dim">p[i] = exp(x[i]-max)/sum</text>
+        <text x="600" y="110" text-anchor="middle" class="svg-dim">output: d_output[i]</text>
+        <text x="600" y="130" text-anchor="middle" class="svg-dim">softmax.cu:71</text>
+
+        <path d="M 220 100 L 256 100" stroke="#0969da" stroke-width="2" marker-end="url(#sx-arr)"/>
+        <path d="M 460 100 L 496 100" stroke="#0969da" stroke-width="2" marker-end="url(#sx-arr)"/>
+        <defs>
+            <marker id="sx-arr" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+                <path d="M0,0 L0,6 L9,3 z" fill="#0969da"/>
+            </marker>
+        </defs>
+
+        <text x="360" y="195" text-anchor="middle" class="svg-dim">
+            kernel end = global barrier · scalars (max, sum) live in tiny global buffers
+        </text>
+    </svg>
+    <div class="caption">Three kernels, two global scalars passed between them. From softmax.cu:131–140.</div>
+</div>
+
+<!-- ===================================================================== -->
+<h2>3. The pattern inside one CTA — tree reduction</h2>
+
+<p>
+    Both reducing kernels use the same trick:
+    each CTA <em>folds its slice of the array in half, repeatedly, in shared
+    memory</em>. After log₂(blockDim.x) folds, thread 0 holds the block's
+    contribution. That contribution gets <code>atomicAdd</code>'d to a global
+    scalar.
+</p>
+
+<p>Here's the inner loop from <code>softmaxPartial</code> (<code>softmax.cu:57–68</code>):</p>
+
+<div class="code-block">
+<pre data-start-line="56" style="--start-line: 56;"><code><span class="line">data[threadIdx.x] = unnorm;                                <span class="cmt">// stage in shared</span></span><span class="line"><span class="kw">for</span> (<span class="ty">int</span> range = blockDim.x / <span class="num">2</span>; range &gt;= <span class="num">1</span>; range /= <span class="num">2</span>) {</span><span class="line">    <span class="kw">if</span> (threadIdx.x &lt; range)</span><span class="line">        data[threadIdx.x] = data[threadIdx.x] + data[threadIdx.x + range];</span><span class="line">    <span class="fn">__syncthreads</span>();                                      <span class="cmt">// wait for all writes</span></span><span class="line">}</span><span class="line"></span><span class="line"><span class="kw">if</span> (threadIdx.x == <span class="num">0</span>) {</span><span class="line">    <span class="kw">float</span> value = data[<span class="num">0</span>];</span><span class="line">    <span class="fn">atomicAdd</span>(exp_sum, value);                              <span class="cmt">// publish block result globally</span></span><span class="line">}</span></code></pre>
+</div>
+
+<p>
+    Each pass halves the active thread count. With <code>blockDim.x = 256</code>,
+    the reduction takes 8 passes (256 → 128 → 64 → … → 1). Step through it:
+</p>
+
+<div class="figure" id="fig-reduce">
+    <svg viewBox="0 0 720 380" preserveAspectRatio="xMidYMid meet">
+        <text x="360" y="22" text-anchor="middle" class="svg-title" id="rTitle">Stage 0 — 8 partial sums in shared memory</text>
+
+        <g id="rCells" transform="translate(40,50)"></g>
+
+        <g id="rArrows" transform="translate(40,140)"></g>
+
+        <text x="360" y="280" text-anchor="middle" class="svg-dim" id="rStatus">tree height 0 — every thread holds its own partial</text>
+        <text x="360" y="310" text-anchor="middle" class="svg-dim" id="rActive">active threads: 8</text>
+        <text x="360" y="340" text-anchor="middle" class="svg-dim" id="rFinal"></text>
+    </svg>
+    <div class="caption" id="rCap">A tree reduction halves the active thread count each pass.</div>
+    <div class="controls">
+        <button data-act="prev">◂ Prev</button>
+        <button data-act="step">Step ▸</button>
+        <button data-act="reset">↺ Reset</button>
+        <span class="tick-label">step 1 / 5</span>
+    </div>
+</div>
+
+<p>
+    Two important properties of this pattern:
+</p>
+
+<ul>
+    <li><strong>No bank conflicts.</strong> At each pass, the active threads
+        access addresses <code>[0..range)</code> and <code>[range..2·range)</code> —
+        both contiguous, both coalesced into shared-memory banks.</li>
+    <li><strong>Warp divergence shrinks each pass.</strong> Once
+        <code>range &lt; 32</code>, only thread 0..(range-1) of the warp does work
+        while the rest sit idle. This is the unavoidable cost of reducing —
+        modern code often switches to <em>warp shuffles</em> for the last few
+        passes, but the stock pattern above is plenty fast for most cases.</li>
+</ul>
+
+<!-- ===================================================================== -->
+<h2>4. Cross-CTA aggregation via <code>atomicAdd</code></h2>
+
+<p>
+    Each CTA finishes its tree reduction with one scalar. We need to combine
+    the scalars from all CTAs. Two real options:
+</p>
+
+<ul>
+    <li><strong>Two-pass.</strong> Write per-block results to an array, then
+        launch a small reduce-of-the-results kernel.</li>
+    <li><strong>Atomic.</strong> Each block does <code>atomicAdd(&amp;global, blockResult)</code>.
+        Used here. Fewer kernel launches, simpler code, slightly slower at very
+        high CTA counts due to atomic contention.</li>
+</ul>
+
+<p>
+    <code>atomicAdd</code> serializes through the L2 cache: even though every
+    CTA tries to update <code>exp_sum[0]</code> simultaneously, the hardware
+    queues them. For softmax sized N=10,000 we have ~10 CTAs — atomic contention
+    is negligible. For very large arrays you'd switch to the two-pass version.
+</p>
+
+<!-- ===================================================================== -->
+<h2>5. The numerical-stability max trick</h2>
+
+<p>
+    Softmax is invariant to additive shifts: subtracting any constant
+    <em>k</em> from every input gives the same output (the constant cancels in
+    the ratio). Picking <em>k = max(x)</em> makes every <code>exp()</code>
+    argument <strong>≤ 0</strong>, so every exp output is in (0, 1] — no
+    overflow possible.
+</p>
+
+<div class="figure" id="fig-stab">
+    <svg viewBox="0 0 720 320" preserveAspectRatio="xMidYMid meet">
+        <text x="180" y="22" text-anchor="middle" class="svg-title">Naive softmax</text>
+        <text x="540" y="22" text-anchor="middle" class="svg-title">Stable softmax (subtract max)</text>
+
+        <g id="stabL" transform="translate(40,50)"></g>
+        <g id="stabR" transform="translate(400,50)"></g>
+
+        <text x="180" y="260" text-anchor="middle" class="svg-dim" id="stabLCap">x = [88, 90, 100]</text>
+        <text x="540" y="260" text-anchor="middle" class="svg-dim" id="stabRCap">x − max = [−12, −10, 0]</text>
+        <text x="180" y="285" text-anchor="middle" class="svg-dim" id="stabLRes"></text>
+        <text x="540" y="285" text-anchor="middle" class="svg-dim" id="stabRRes"></text>
+    </svg>
+    <div class="caption" id="stabFigCap">Same inputs, two different code paths. Step to compute exp() on each side.</div>
+    <div class="controls">
+        <button data-act="prev">◂ Prev</button>
+        <button data-act="step">Step ▸</button>
+        <button data-act="reset">↺ Reset</button>
+        <span class="tick-label">step 1 / 4</span>
+    </div>
+</div>
+
+<!-- ===================================================================== -->
+<h2>6. Memory-hierarchy story for the whole pipeline</h2>
+
+<table>
+<tr><th>Kernel</th><th>Reads</th><th>Shared mem</th><th>Writes</th></tr>
+<tr><td>findMaxKernel</td><td>x[] (coalesced)</td><td>256 floats (tree)</td><td>atomicAdd → d_max[0]</td></tr>
+<tr><td>softmaxPartial</td><td>x[] (again, coalesced), d_max[0] (broadcast)</td><td>256 floats (tree)</td><td>atomicAdd → d_sum[0]</td></tr>
+<tr><td>softmaxNormalize</td><td>x[] (third time, coalesced), d_max[0], d_sum[0]</td><td>—</td><td>output[i] (coalesced)</td></tr>
+</table>
+
+<p>
+    Note: <strong>x is read three times</strong>. That looks wasteful, but for a
+    10 KB array it sits entirely in L2 (1.5 MB) after the first pass, so passes
+    2 and 3 are L2 hits, not DRAM hits. The kernel is still dominated by the
+    first DRAM read.
+</p>
+
+<!-- ===================================================================== -->
+<h2>7. Subtle bits</h2>
+
+<ul>
+    <li><strong>2 elements per thread.</strong> Each kernel issues two loads per
+        thread (lines 49–55) and reduces both into one partial. This doubles the
+        useful work per thread and halves the CTA count, saving launch overhead
+        and atomic-contention.</li>
+    <li><strong><code>__shared__ float data[256]</code></strong> — sized to
+        <code>blockDim.x</code> exactly. Each thread owns one slot. No tile
+        padding needed because we never do a "column" access pattern.</li>
+    <li><strong><code>cudaMemset(d_sum, 0, ...)</code> before launch</strong> —
+        atomicAdd accumulates into whatever is there. Must zero between trials
+        (lines 133–134).</li>
+    <li><strong>One scalar broadcast across all threads</strong> —
+        <code>max_val[0]</code> on line 47 is read by every thread of every CTA.
+        It's a single 4-byte value sitting in L2; the broadcast is free.</li>
+</ul>
+
+<!-- ===================================================================== -->
+<h2>8. Pitfalls</h2>
+
+<ul>
+    <li><strong>Forgetting to subtract max</strong> → <code>exp(big number)</code> → <code>+inf</code> → <code>nan</code>. The CPU reference (<code>softmax.cu:11</code>) does the same trick for the same reason.</li>
+    <li><strong>Forgetting to <code>cudaMemset</code> the sum scalar</strong> → previous trial's value leaks in.</li>
+    <li><strong>Misaligned tree reduction</strong>: if <code>blockDim.x</code> isn't a power of two, the <code>range /= 2</code> loop drops elements. The kernel here uses 256 = 2⁸, so it's clean.</li>
+    <li><strong>Atomic contention</strong> at very large N — the single global
+        scalar becomes a serial bottleneck. Switch to a two-stage reduce.</li>
+</ul>
+
+<footer>
+    Next: <a href="topk.html">→ Top-K</a> — same shared-histogram pattern, but
+    used to find the K-th largest element via radix bucketing.
+</footer>
+
+</main>
+
+<script>
+class StepFig {
+    constructor(figEl, ticks) {
+        this.fig = figEl; this.ticks = ticks; this.idx = 0;
+        this.cap = figEl.querySelector('.caption');
+        this.tickLabel = figEl.querySelector('.tick-label');
+        this.btnPrev  = figEl.querySelector('[data-act=prev]');
+        this.btnStep  = figEl.querySelector('[data-act=step]');
+        this.btnReset = figEl.querySelector('[data-act=reset]');
+        if (this.btnPrev)  this.btnPrev.addEventListener('click', () => this.prev());
+        if (this.btnStep)  this.btnStep.addEventListener('click', () => this.step());
+        if (this.btnReset) this.btnReset.addEventListener('click', () => this.reset());
+        this.render();
+    }
+    render() {
+        this.ticks[this.idx].apply();
+        if (this.cap) this.cap.textContent = this.ticks[this.idx].caption;
+        if (this.tickLabel) this.tickLabel.textContent = `step ${this.idx + 1} / ${this.ticks.length}`;
+        if (this.btnPrev) this.btnPrev.disabled = (this.idx === 0);
+        if (this.btnStep) this.btnStep.disabled = (this.idx === this.ticks.length - 1);
+    }
+    step()  { if (this.idx < this.ticks.length - 1) { this.idx++; this.render(); } }
+    prev()  { if (this.idx > 0) { this.idx--; this.render(); } }
+    reset() { this.idx = 0; this.render(); }
+}
+const NS = 'http://www.w3.org/2000/svg';
+function mk(tag, attrs = {}, parent = null) {
+    const el = document.createElementNS(NS, tag);
+    for (const k in attrs) el.setAttribute(k, attrs[k]);
+    if (parent) parent.appendChild(el);
+    return el;
+}
+
+// ===================================================================
+// Tree reduction animation (sum of 8 values)
+// ===================================================================
+(function () {
+    const fig = document.getElementById('fig-reduce');
+    const N = 8;
+    const rCells = fig.querySelector('#rCells');
+    const rArrows = fig.querySelector('#rArrows');
+    const title = fig.querySelector('#rTitle');
+    const status = fig.querySelector('#rStatus');
+    const active = fig.querySelector('#rActive');
+    const finalT = fig.querySelector('#rFinal');
+
+    const cw = 80;
+    const cells = [];
+    const labels = [];
+    const startVals = [3, 7, 2, 9, 4, 1, 5, 8];
+    for (let i = 0; i < N; i++) {
+        cells.push(mk('rect', { x: i*cw, y: 0, width: cw-8, height: 60, rx: 4,
+            fill: '#fff8c5', stroke: '#9a6700' }, rCells));
+        labels.push(mk('text', { x: i*cw + (cw-8)/2, y: 38, 'text-anchor': 'middle', class: 'svg-lbl' }, rCells));
+        mk('text', { x: i*cw + (cw-8)/2, y: 80, 'text-anchor': 'middle', class: 'svg-dim' }, rCells)
+            .textContent = 't' + i;
+    }
+    function clearArrows() { while (rArrows.firstChild) rArrows.removeChild(rArrows.firstChild); }
+    function paintCells(vals, activeIdx) {
+        for (let i = 0; i < N; i++) {
+            labels[i].textContent = vals[i] === null ? '–' : vals[i];
+            cells[i].setAttribute('fill', activeIdx.includes(i) ? '#7fd296' : '#fff8c5');
+        }
+    }
+    function drawPairs(range) {
+        clearArrows();
+        for (let i = 0; i < range; i++) {
+            const fromX = i*cw + (cw-8)/2;
+            const toX   = (i + range)*cw + (cw-8)/2;
+            mk('path', { d: `M ${toX} 0 Q ${(fromX+toX)/2} 60 ${fromX} 0`,
+                fill: 'none', stroke: '#0969da', 'stroke-width': 2, 'marker-end':'url(#redarr)' }, rArrows);
+        }
+        // single defs node only once
+        if (!rArrows.querySelector('defs')) {
+            const defs = mk('defs', {}, rArrows);
+            const m = mk('marker', { id:'redarr', markerWidth: 10, markerHeight: 10, refX: 9, refY: 3, orient: 'auto' }, defs);
+            mk('path', { d: 'M0,0 L0,6 L9,3 z', fill: '#0969da' }, m);
+        }
+    }
+    function setState(s) {
+        title.textContent = s.title;
+        status.textContent = s.status;
+        active.textContent = `active threads: ${s.active}`;
+        finalT.textContent = s.finalText || '';
+        if (s.range !== null) drawPairs(s.range); else clearArrows();
+        paintCells(s.vals, s.hot);
+    }
+    const v0 = [...startVals];           // 3,7,2,9,4,1,5,8
+    const v1 = [3+4, 7+1, 2+5, 9+8, null, null, null, null];   // 7, 8, 7, 17
+    const v2 = [7+7, 8+17, null, null, null, null, null, null]; // 14, 25
+    const v3 = [14+25, null, null, null, null, null, null, null]; // 39
+
+    const ticks = [
+        { caption: 'Stage 0: each thread holds one partial sum in shared memory.',
+          apply: () => setState({ title: 'Stage 0 — 8 values, 8 active threads', range: null,
+            vals: v0, hot: [0,1,2,3,4,5,6,7], status: 'tree height 0 — every thread holds its own partial', active: 8 }) },
+        { caption: 'Pass 1: range=4. Threads 0..3 fold in partners at +4. The other half goes idle.',
+          apply: () => setState({ title: 'Pass 1 — range = 4', range: 4,
+            vals: v1, hot: [0,1,2,3], status: 'each active thread does: data[i] += data[i+4]', active: 4 }) },
+        { caption: 'Pass 2: range=2. Threads 0..1 fold once more. Then __syncthreads().',
+          apply: () => setState({ title: 'Pass 2 — range = 2', range: 2,
+            vals: v2, hot: [0,1], status: 'each active thread does: data[i] += data[i+2]', active: 2 }) },
+        { caption: 'Pass 3: range=1. Thread 0 folds the last pair. Block total is in data[0].',
+          apply: () => setState({ title: 'Pass 3 — range = 1', range: 1,
+            vals: v3, hot: [0], status: 'thread 0: data[0] += data[1]', active: 1 }) },
+        { caption: 'Done. Thread 0 calls atomicAdd(global_sum, data[0]). Block contributes 39 to the global total.',
+          apply: () => setState({ title: 'Publish — atomicAdd to global', range: null,
+            vals: v3, hot: [0], status: 'data[0] = 39 → atomicAdd(exp_sum, 39)',
+            active: 1, finalText: 'all CTAs do this; the global scalar accumulates serially through L2' }) },
+    ];
+    new StepFig(fig, ticks);
+})();
+
+// ===================================================================
+// Numerical stability animation
+// ===================================================================
+(function () {
+    const fig = document.getElementById('fig-stab');
+    const L = fig.querySelector('#stabL');
+    const R = fig.querySelector('#stabR');
+    const lCap = fig.querySelector('#stabLCap');
+    const rCap = fig.querySelector('#stabRCap');
+    const lRes = fig.querySelector('#stabLRes');
+    const rRes = fig.querySelector('#stabRRes');
+
+    // 3 cells each side
+    const cw = 90;
+    function buildRow(parent, vals, withResult) {
+        for (let i = 0; i < 3; i++) {
+            mk('rect', { x: i*cw, y: 0, width: cw-10, height: 40, rx: 4,
+                fill: '#fff8c5', stroke: '#9a6700' }, parent);
+            mk('text', { x: i*cw + (cw-10)/2, y: 26, 'text-anchor': 'middle', class: 'svg-lbl' }, parent)
+                .textContent = vals[i];
+        }
+        // exp() row
+        for (let i = 0; i < 3; i++) {
+            const r = mk('rect', { x: i*cw, y: 60, width: cw-10, height: 40, rx: 4,
+                fill: '#ffebe9', stroke: '#cf222e', opacity: 0 }, parent);
+            const t = mk('text', { x: i*cw + (cw-10)/2, y: 86, 'text-anchor': 'middle', class: 'svg-lbl', opacity: 0 }, parent);
+            t.textContent = '';
+            r.classList.add('expRect'); t.classList.add('expText');
+        }
+        // softmax row
+        for (let i = 0; i < 3; i++) {
+            const r = mk('rect', { x: i*cw, y: 120, width: cw-10, height: 40, rx: 4,
+                fill: '#dafbe1', stroke: '#1a7f37', opacity: 0 }, parent);
+            const t = mk('text', { x: i*cw + (cw-10)/2, y: 146, 'text-anchor': 'middle', class: 'svg-lbl', opacity: 0 }, parent);
+            t.textContent = '';
+            r.classList.add('smRect'); t.classList.add('smText');
+        }
+    }
+    buildRow(L, [88, 90, 100], false);
+    buildRow(R, [-12, -10, 0], true);
+
+    const lExpVals = ['e^88', 'e^90', 'e^100'];
+    const lExpReal = ['1.7e38', '1.2e39', '2.7e43'];
+    const rExpVals = ['6.1e-6', '4.5e-5', '1.0'];
+    const lSmText = ['nan', 'nan', 'nan'];
+    const rSmText = ['~6e-6', '~4.5e-5', '~1.0'];
+
+    function setRow(parent, expOp, expText, smOp, smText) {
+        const expRs = parent.querySelectorAll('.expRect');
+        const expTs = parent.querySelectorAll('.expText');
+        const smRs  = parent.querySelectorAll('.smRect');
+        const smTs  = parent.querySelectorAll('.smText');
+        expRs.forEach((r, i) => { r.setAttribute('opacity', expOp); });
+        expTs.forEach((t, i) => { t.setAttribute('opacity', expOp); t.textContent = expText[i] || ''; });
+        smRs.forEach((r, i)  => { r.setAttribute('opacity', smOp); });
+        smTs.forEach((t, i)  => { t.setAttribute('opacity', smOp); t.textContent = smText[i] || ''; });
+    }
+
+    const ticks = [
+        { caption: 'Both sides start with the same inputs, just shifted by max(x) = 100.',
+          apply: () => {
+              setRow(L, 0, ['','',''], 0, ['','','']);
+              setRow(R, 0, ['','',''], 0, ['','','']);
+              lRes.textContent = ''; rRes.textContent = '';
+          } },
+        { caption: 'Compute exp() on each side. Naive overflows FP32 (max float ≈ 3.4e38). Stable side stays in (0, 1].',
+          apply: () => {
+              setRow(L, 1, lExpReal, 0, ['','','']);
+              setRow(R, 1, rExpVals, 0, ['','','']);
+              lRes.textContent = 'exp(100) overflows → +inf'; rRes.textContent = '';
+          } },
+        { caption: 'Sum and divide. Naive: inf/inf = nan everywhere. Stable: clean ratios.',
+          apply: () => {
+              setRow(L, 1, lExpReal, 1, lSmText);
+              setRow(R, 1, rExpVals, 1, rSmText);
+              lRes.textContent = 'output: nan, nan, nan'; rRes.textContent = 'output: valid probabilities';
+          } },
+        { caption: 'That single subtraction (softmax.cu:51, 76) is the entire difference between a working softmax and garbage.',
+          apply: () => {
+              setRow(L, 1, lExpReal, 1, lSmText);
+              setRow(R, 1, rExpVals, 1, rSmText);
+              lRes.textContent = 'broken'; rRes.textContent = 'works for any input range';
+          } },
+    ];
+    new StepFig(fig, ticks);
+})();
+</script>
+</body>
+</html>
