@@ -60,60 +60,212 @@
 </div>
 
 <!-- ===================================================================== -->
-<h2>2. The memory hierarchy, to scale</h2>
+<h2>2. The bigger picture — where the GPU sits</h2>
 
 <p>
-    Imagine each byte you touch lives somewhere on this pyramid. The higher up,
-    the faster — and the smaller. The whole game of GPU programming is
-    <strong>moving the right bytes up the pyramid at the right time.</strong>
+    Before zooming into the chip, it helps to see the whole machine. A GPU is not
+    the computer — it's an accelerator hanging off a CPU. Data starts life in CPU
+    memory, crosses a <strong>PCIe</strong> link into the GPU's own DRAM, and only
+    then can the SMs touch it. In a training rig there are usually <em>several</em>
+    GPUs wired together with a much fatter link (<strong>NVLink</strong>).
+</p>
+
+<div class="figure">
+    <svg viewBox="0 0 720 400" preserveAspectRatio="xMidYMid meet" aria-label="System topology: CPU, PCIe, GPUs, NVLink">
+        <!-- CPU / host -->
+        <rect x="24" y="40" width="200" height="120" fill="#eef2f6" stroke="#afb8c1" rx="8" />
+        <text x="124" y="64" text-anchor="middle" class="svg-title">CPU (host)</text>
+        <rect x="44" y="80" width="160" height="30" fill="#ffffff" stroke="#d0d7de" rx="4" />
+        <text x="124" y="100" text-anchor="middle" class="svg-dim">cores + L1/L2/L3</text>
+        <rect x="44" y="118" width="160" height="30" fill="#ffebe9" stroke="#cf222e" rx="4" />
+        <text x="124" y="138" text-anchor="middle" class="svg-dim">system DRAM · O(100 GB–1 TB)</text>
+
+        <!-- PCIe link -->
+        <line x1="224" y1="100" x2="330" y2="100" stroke="#0969da" stroke-width="3" marker-end="url(#arrH)" />
+        <line x1="330" y1="120" x2="224" y2="120" stroke="#0969da" stroke-width="3" marker-end="url(#arrH2)" />
+        <text x="277" y="92" text-anchor="middle" class="svg-dim">PCIe</text>
+        <text x="277" y="150" text-anchor="middle" class="svg-dim">~16–32 GB/s each way</text>
+
+        <!-- GPU 0 -->
+        <rect x="330" y="24" width="230" height="352" fill="#ffffff" stroke="#afb8c1" rx="10" />
+        <text x="445" y="46" text-anchor="middle" class="svg-title">GPU 0</text>
+
+        <rect x="346" y="60" width="198" height="70" fill="#ffebe9" stroke="#cf222e" rx="6" />
+        <text x="445" y="84" text-anchor="middle" class="svg-lbl" fill="#cf222e">DRAM = HBM ("global memory")</text>
+        <text x="445" y="102" text-anchor="middle" class="svg-dim">6 GB here · 80 GB on an H100</text>
+        <text x="445" y="118" text-anchor="middle" class="svg-dim">mostly weights · every SM can read it</text>
+
+        <rect x="346" y="140" width="198" height="34" fill="#fff1cf" stroke="#bf8700" rx="6" />
+        <text x="445" y="162" text-anchor="middle" class="svg-lbl" fill="#bf8700">L2 cache (chip-wide)</text>
+
+        <g id="smRow">
+            <rect x="346" y="188" width="44" height="40" fill="#dafbe1" stroke="#1a7f37" rx="4" />
+            <rect x="398" y="188" width="44" height="40" fill="#dafbe1" stroke="#1a7f37" rx="4" />
+            <rect x="450" y="188" width="44" height="40" fill="#dafbe1" stroke="#1a7f37" rx="4" />
+            <rect x="502" y="188" width="42" height="40" fill="#dafbe1" stroke="#1a7f37" rx="4" />
+        </g>
+        <text x="368" y="212" text-anchor="middle" class="svg-lbl" fill="#1a7f37">SM</text>
+        <text x="420" y="212" text-anchor="middle" class="svg-lbl" fill="#1a7f37">SM</text>
+        <text x="472" y="212" text-anchor="middle" class="svg-lbl" fill="#1a7f37">SM</text>
+        <text x="523" y="212" text-anchor="middle" class="svg-lbl" fill="#1a7f37">…</text>
+        <text x="445" y="250" text-anchor="middle" class="svg-dim">O(100) SMs · 22 here, 132 on an H100</text>
+
+        <text x="445" y="284" text-anchor="middle" class="svg-dim">bandwidth climbs as you go up:</text>
+        <text x="445" y="302" text-anchor="middle" class="svg-dim">HBM ~0.3 TB/s → L2 → SRAM → registers</text>
+        <text x="445" y="320" text-anchor="middle" class="svg-dim">(H100: 3.35 TB/s HBM, 370 TB/s registers)</text>
+
+        <!-- NVLink to GPU 1 -->
+        <line x1="560" y1="200" x2="640" y2="200" stroke="#8250df" stroke-width="4" marker-end="url(#arrP)" />
+        <text x="600" y="192" text-anchor="middle" class="svg-dim">NVLink</text>
+        <text x="600" y="230" text-anchor="middle" class="svg-dim">up to</text>
+        <text x="600" y="244" text-anchor="middle" class="svg-dim">900 GB/s</text>
+
+        <rect x="640" y="60" width="56" height="316" fill="#ffffff" stroke="#afb8c1" rx="8" />
+        <text x="668" y="220" text-anchor="middle" class="svg-title" transform="rotate(90 668 220)">GPU 1 …</text>
+
+        <defs>
+            <marker id="arrH"  markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#0969da"/></marker>
+            <marker id="arrH2" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#0969da"/></marker>
+            <marker id="arrP"  markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#8250df"/></marker>
+        </defs>
+    </svg>
+    <div class="caption">CPU ↔ GPU over PCIe; GPU ↔ GPU over NVLink. Inside a GPU: HBM → L2 → SMs.</div>
+</div>
+
+<h3>Three links, three speeds</h3>
+<ul>
+    <li><strong>PCIe (CPU ↔ GPU)</strong> is the <em>narrowest</em> pipe — tens of GB/s.
+        Moving a tensor across it is expensive, so you copy inputs to the GPU once and
+        keep them there. On datacenter parts PCIe is ~128 GB/s bidirectional; on this
+        card it's less. Either way it's dwarfed by on-GPU bandwidth.</li>
+    <li><strong>NVLink (GPU ↔ GPU)</strong> is a wide link (up to 900 GB/s per GPU on
+        NVLink-equipped datacenter cards) used to shard a model that doesn't fit on one
+        GPU. Consumer cards like the 1660 Super don't have it.</li>
+    <li><strong>HBM / GDDR6 (the GPU's own DRAM)</strong> is what CUDA calls
+        <strong>global memory</strong>. It's the biggest, slowest tier <em>on</em> the
+        GPU, and it's where your input tensors and weights live. Every SM can read it;
+        the entire rest of this primer is about not reading it more than you have to.</li>
+</ul>
+
+<div class="callout">
+    <strong>Trend to keep in mind:</strong> across GPU generations, <em>compute gets
+    much faster while memory bandwidth grows only a little</em>. That gap is why so many
+    kernels are memory-bound, and why the optimizations here — coalescing, shared-memory
+    tiling, fusion — keep paying off.
+</div>
+
+<!-- ===================================================================== -->
+<h2>3. The memory hierarchy, to scale</h2>
+
+<p>
+    Every byte you touch lives somewhere on a hierarchy: the higher up, the faster —
+    and the smaller. <strong>CPUs and GPUs share the same shape</strong> (registers on
+    top, DRAM at the bottom) but make opposite bets. A CPU spends its transistors on a
+    <em>deep cache stack</em> (L1/L2/L3) to make a few threads' memory accesses low-latency.
+    A GPU spends them on a <em>huge register file and programmer-managed SRAM</em> so
+    thousands of threads can hide latency instead. The whole game of GPU programming is
+    <strong>moving the right bytes up this hierarchy and reusing them before they fall back down.</strong>
 </p>
 
 <div class="figure" id="fig-mem">
-    <svg viewBox="0 0 720 380" preserveAspectRatio="xMidYMid meet" aria-label="GPU memory hierarchy">
-        <g id="memHier">
-            <!-- Register layer (top) -->
-            <polygon points="320,20 400,20 440,80 280,80" fill="#dafbe1" stroke="#1a7f37" />
-            <text x="360" y="50" text-anchor="middle" class="svg-title">Registers</text>
-            <text x="360" y="68" text-anchor="middle" class="svg-dim">~1 cycle · per-thread · 64K×32b per SM</text>
+    <svg viewBox="0 0 720 352" preserveAspectRatio="xMidYMid meet" aria-label="CPU vs GPU memory hierarchy, side by side">
+        <text x="185" y="26" text-anchor="middle" class="svg-title">CPU</text>
+        <text x="535" y="26" text-anchor="middle" class="svg-title">GPU — GTX 1660 Super</text>
 
-            <!-- L1 / shared -->
-            <polygon points="280,80 440,80 480,150 240,150" fill="#fff8c5" stroke="#9a6700" />
-            <text x="360" y="110" text-anchor="middle" class="svg-title">L1 / Shared (SRAM)</text>
-            <text x="360" y="128" text-anchor="middle" class="svg-dim">~1–4 cycles · per-SM · 96 KB</text>
+        <!-- ===== row: registers ===== -->
+        <rect x="120" y="42" width="130" height="40" rx="5" fill="#dafbe1" stroke="#1a7f37" />
+        <text x="185" y="59" text-anchor="middle" class="svg-lbl" fill="#1a7f37">registers</text>
+        <text x="185" y="73" text-anchor="middle" class="svg-dim">few KB/core · ~1 cyc</text>
 
-            <!-- L2 -->
-            <polygon points="240,150 480,150 540,240 180,240" fill="#fff1cf" stroke="#bf8700" />
-            <text x="360" y="190" text-anchor="middle" class="svg-title">L2 cache</text>
-            <text x="360" y="208" text-anchor="middle" class="svg-dim">~200 cycles · chip-wide · 1.5 MB total</text>
+        <rect x="470" y="42" width="130" height="40" rx="5" fill="#dafbe1" stroke="#1a7f37" />
+        <text x="535" y="59" text-anchor="middle" class="svg-lbl" fill="#1a7f37">registers</text>
+        <text x="535" y="73" text-anchor="middle" class="svg-dim">256 KB/SM · ~1 cyc</text>
 
-            <!-- DRAM (bottom) -->
-            <polygon points="180,240 540,240 640,360 80,360" fill="#ffebe9" stroke="#cf222e" />
-            <text x="360" y="290" text-anchor="middle" class="svg-title">DRAM (GDDR6)</text>
-            <text x="360" y="310" text-anchor="middle" class="svg-dim">~500 cycles · off-chip · 6 GB · 336 GB/s</text>
-            <text x="360" y="328" text-anchor="middle" class="svg-dim">↑ everything starts here ↑</text>
-        </g>
+        <!-- ===== row: L1 ===== -->
+        <rect x="100" y="90" width="170" height="40" rx="5" fill="#fff8c5" stroke="#9a6700" />
+        <text x="185" y="107" text-anchor="middle" class="svg-lbl" fill="#9a6700">L1 cache</text>
+        <text x="185" y="121" text-anchor="middle" class="svg-dim">32 KB/core · ~4 cyc</text>
 
-        <!-- Side annotations -->
-        <text x="660" y="50"  class="svg-dim" text-anchor="end">fastest</text>
-        <text x="660" y="350" class="svg-dim" text-anchor="end">slowest</text>
-        <text x="660" y="65"  class="svg-dim" text-anchor="end">smallest</text>
-        <text x="660" y="335" class="svg-dim" text-anchor="end">biggest</text>
+        <rect x="450" y="90" width="170" height="40" rx="5" fill="#fff8c5" stroke="#9a6700" />
+        <text x="535" y="107" text-anchor="middle" class="svg-lbl" fill="#9a6700">L1 / Shared (SRAM)</text>
+        <text x="535" y="121" text-anchor="middle" class="svg-dim">"shared memory" (SMEM) · 96 KB/SM</text>
 
-        <!-- Moving "byte" packet -->
-        <g id="bytePacket" opacity="0">
-            <circle r="11" fill="#0969da" />
-            <text dy="3.5" text-anchor="middle" class="svg-lbl" fill="#fff" font-weight="700">B</text>
-        </g>
-        <text id="byteLabel" x="60" y="22" class="svg-lbl" fill="#0969da">a byte's journey…</text>
+        <!-- ===== row: L2 ===== -->
+        <rect x="80" y="138" width="210" height="40" rx="5" fill="#fff1cf" stroke="#bf8700" />
+        <text x="185" y="155" text-anchor="middle" class="svg-lbl" fill="#bf8700">L2 cache</text>
+        <text x="185" y="169" text-anchor="middle" class="svg-dim">~512 KB/core · ~12 cyc</text>
+
+        <rect x="430" y="138" width="210" height="40" rx="5" fill="#fff1cf" stroke="#bf8700" />
+        <text x="535" y="155" text-anchor="middle" class="svg-lbl" fill="#bf8700">L2 cache</text>
+        <text x="535" y="169" text-anchor="middle" class="svg-dim">1.5 MB · chip-wide · ~200 cyc</text>
+
+        <!-- ===== row: L3 (CPU only) ===== -->
+        <rect x="60" y="186" width="250" height="40" rx="5" fill="#eaeef2" stroke="#57606a" />
+        <text x="185" y="203" text-anchor="middle" class="svg-lbl" fill="#57606a">L3 cache</text>
+        <text x="185" y="217" text-anchor="middle" class="svg-dim">8–32 MB shared · ~40 cyc</text>
+
+        <rect x="410" y="186" width="250" height="40" rx="5" fill="none" stroke="#afb8c1" stroke-dasharray="5 4" />
+        <text x="535" y="210" text-anchor="middle" class="svg-dim">no L3 — the GPU hierarchy stops at L2</text>
+
+        <!-- ===== row: DRAM ===== -->
+        <rect x="40" y="234" width="290" height="54" rx="5" fill="#ffebe9" stroke="#cf222e" />
+        <text x="185" y="252" text-anchor="middle" class="svg-lbl" fill="#cf222e">DRAM (DDR)</text>
+        <text x="185" y="266" text-anchor="middle" class="svg-dim">"main memory"</text>
+        <text x="185" y="280" text-anchor="middle" class="svg-dim">16–128 GB · ~60 GB/s · ~200+ cyc</text>
+
+        <rect x="390" y="234" width="290" height="54" rx="5" fill="#ffebe9" stroke="#cf222e" />
+        <text x="535" y="252" text-anchor="middle" class="svg-lbl" fill="#cf222e">DRAM = HBM / GDDR6</text>
+        <text x="535" y="266" text-anchor="middle" class="svg-dim">"global memory" (GMEM) · "device memory"</text>
+        <text x="535" y="280" text-anchor="middle" class="svg-dim">6 GB · 336 GB/s · ~500 cyc</text>
+
+        <!-- axis note -->
+        <text x="360" y="312" text-anchor="middle" class="svg-dim">↑ faster &amp; smaller   ·   wider bar = more capacity   ·   slower &amp; bigger ↓</text>
     </svg>
-    <div class="caption" id="cap-mem">Click <strong>Step ▸</strong> to walk one byte from DRAM up to a register.</div>
-    <div class="controls">
-        <button data-act="prev">◂ Prev</button>
-        <button data-act="step">Step ▸</button>
-        <button data-act="reset">↺ Reset</button>
-        <span class="tick-label">step 1 / 5</span>
-    </div>
+    <div class="caption">Same shape, opposite bets: the CPU invests in a deep L1→L2→L3 cache stack; the GPU drops L3, grows the register file, and hands you the SRAM as programmer-managed shared memory.</div>
 </div>
+
+<p>
+    Read across a row and the contrast is sharp. The GPU's <strong>register file is
+    ~100× larger per core-equivalent</strong> than a CPU's — it has to be, to hold state
+    for thousands of resident threads. Its <strong>DRAM bandwidth is ~5× higher</strong>
+    (336 GB/s vs ~60 GB/s) because throughput, not latency, is the point. And it has
+    <strong>no L3 at all</strong>: where a CPU leans on a big shared last-level cache to
+    keep a handful of threads fast, the GPU expects <em>you</em> to stage data explicitly
+    into shared memory and to keep enough warps in flight that DRAM latency simply
+    disappears behind other work.
+</p>
+
+<div class="callout">
+    <strong>The same tier has many names.</strong> The GPU's DRAM row alone goes by half
+    a dozen: it's the physical memory (<strong>HBM</strong> on datacenter cards,
+    <strong>GDDR6</strong> here), which CUDA calls <strong>global memory</strong> /
+    <strong>GMEM</strong> / <strong>device memory</strong>. They all point at the same
+    bottom tier. Watch for these aliases across the site and in NVIDIA's docs:
+</div>
+
+<table>
+<tr><th>Tier in the diagram</th><th>Other names you'll see</th><th>What it physically is</th></tr>
+<tr>
+    <td><strong>DRAM</strong></td>
+    <td class="mono">HBM · GDDR6 · global memory · GMEM · device memory</td>
+    <td>Off-chip DRAM — the GPU's own main memory. Everything starts here.</td>
+</tr>
+<tr>
+    <td><strong>L1 / Shared</strong></td>
+    <td class="mono">SRAM · shared memory · SMEM · scratchpad</td>
+    <td>On-SM SRAM; the programmer-managed part is "shared memory," the automatic part is the L1 cache.</td>
+</tr>
+<tr>
+    <td><strong>L2</strong></td>
+    <td class="mono">L2 cache · last-level cache</td>
+    <td>The single chip-wide hardware cache in front of DRAM.</td>
+</tr>
+<tr>
+    <td><strong>Registers</strong></td>
+    <td class="mono">register file · RF</td>
+    <td>Per-thread fast storage. Overflow spills to <em>local memory</em> — which is just private DRAM, despite the name.</td>
+</tr>
+</table>
 
 <p class="dim small">
     The latencies above are approximate — the real numbers vary with contention —
@@ -121,8 +273,81 @@
     roughly <strong>500× more cycles</strong> than touching a register.
 </p>
 
+<h3>The GPU hierarchy, tier by tier</h3>
+
+<p>
+    Zooming back in on the GPU side: every tier is a trade of the same currency,
+    <strong>capacity for bandwidth</strong>. The register file is blindingly fast but
+    tiny; DRAM is huge but slow. There is no tier that is both big and fast — if there
+    were, we'd only build that one.
+</p>
+
+<table>
+<tr>
+    <th>Tier</th><th>Scope</th><th>Capacity</th>
+    <th>Bandwidth (this card)</th><th>Latency</th><th>Managed by</th><th>What lives here</th>
+</tr>
+<tr>
+    <td><strong>Registers</strong></td><td>per-thread</td><td class="mono">256 KB / SM</td>
+    <td class="mono">~8 TB/s</td><td class="mono">~1 cyc</td><td>compiler</td>
+    <td>a thread's live scalars — loop counters, accumulators</td>
+</tr>
+<tr>
+    <td><strong>L1 / Shared (SRAM)</strong></td><td>per-SM</td><td class="mono">96 KB / SM</td>
+    <td class="mono">~4 TB/s</td><td class="mono">~1–4 cyc</td><td>you (shared) / HW (L1)</td>
+    <td>tiles a CTA reuses; hand-staged scratchpad</td>
+</tr>
+<tr>
+    <td><strong>L2 cache</strong></td><td>chip-wide</td><td class="mono">1.5 MB</td>
+    <td class="mono">~1.7 TB/s</td><td class="mono">~200 cyc</td><td>hardware</td>
+    <td>data shared between SMs; recently-touched DRAM lines</td>
+</tr>
+<tr>
+    <td><strong>DRAM</strong> (global)</td><td>whole GPU</td><td class="mono">6 GB</td>
+    <td class="mono">336 GB/s</td><td class="mono">~500 cyc</td><td>you (cudaMalloc)</td>
+    <td>every input tensor and weight — the starting point</td>
+</tr>
+</table>
+
+<p class="small dim">
+    Register and L1/shared bandwidth are aggregate across the SM's ports and vary with
+    access pattern — treat them as "order-of-magnitude faster than the tier below," which
+    is the number that actually drives decisions. Datacenter parts (H100) keep the same
+    <em>ordering</em> but multiply every figure: 3.35 TB/s HBM, 31 TB/s SRAM, 370 TB/s
+    registers.
+</p>
+
+<h3>Two things this hierarchy forces on you</h3>
+<ul>
+    <li><strong>Reuse beats re-fetch.</strong> A byte pulled from DRAM should do as much
+        work as possible before you drop it. Loading a value into shared memory or a
+        register and using it once is nearly as wasteful as not caching at all — the win
+        comes from touching it <em>many</em> times while it's up the pyramid. This is the
+        entire motivation for tiling.</li>
+    <li><strong>Higher tiers are small, so you stage deliberately.</strong> You can't
+        park a whole matrix in 96 KB of shared memory. You bring up a <em>tile</em>, work
+        it, evict it, bring up the next. Choosing tile sizes that fit the SRAM budget —
+        without killing occupancy — is the core craft of a fast kernel.</li>
+</ul>
+
+<div class="callout">
+    <strong>Shared memory vs L1 — same silicon, different control.</strong> On this card
+    the 96 KB per SM is <em>one</em> physical block of SRAM. Part of it acts as an
+    automatic <strong>L1 cache</strong> (hardware decides what to keep); the rest is
+    <strong>shared memory</strong> — a scratchpad <em>you</em> address explicitly and
+    that every thread in the CTA can see. The split is configurable. Shared memory is how
+    a CTA's threads cooperate; L1 is a safety net for everything else.
+</div>
+
+<div class="callout warn">
+    <strong>Registers can spill.</strong> If a thread needs more live values than its
+    register budget, the compiler "spills" the overflow to <strong>local memory</strong> —
+    which, despite the name, is just a private slice of slow DRAM. A kernel that looks
+    compute-heavy but runs slow is often quietly spilling; watch your register count.
+</div>
+
 <!-- ===================================================================== -->
-<h2>3. How threads are organized — grid, CTA, warp, thread</h2>
+<h2>4. How threads are organized — grid, CTA, warp, thread</h2>
 
 <p>
     When you launch a CUDA kernel with <code>kernel&lt;&lt;&lt;gridDim, blockDim&gt;&gt;&gt;(…)</code>,
@@ -165,15 +390,47 @@
     </div>
 </div>
 
+<h3>How a thread finds its place — the four built-ins</h3>
+
+<p>
+    Every thread runs the <em>same</em> kernel code, so the only way it knows which
+    piece of the work is <em>its</em> piece is by reading four built-in variables the
+    hardware fills in for it:
+</p>
+
+<table>
+<tr><th>Built-in</th><th>Meaning</th></tr>
+<tr><td class="mono">threadIdx</td><td>Index of this thread <em>within its CTA</em>.</td></tr>
+<tr><td class="mono">blockIdx</td><td>Index of this thread's CTA <em>within the grid</em>.</td></tr>
+<tr><td class="mono">blockDim</td><td>Number of threads per CTA (the <code>blockDim</code> you launched with).</td></tr>
+<tr><td class="mono">gridDim</td><td>Number of CTAs in the grid (the <code>gridDim</code> you launched with).</td></tr>
+</table>
+
+<p>
+    The classic one-liner <code>int i = blockIdx.x * blockDim.x + threadIdx.x;</code>
+    turns "which CTA am I in, and where inside it" into a single global index. All of
+    these can be 1-, 2-, or 3-dimensional (<code>.x</code>, <code>.y</code>,
+    <code>.z</code>), which is handy for tiling 2-D matrices.
+</p>
+
+<div class="callout">
+    <strong>One thread ≠ one output element.</strong> It's tempting to assume every
+    thread computes exactly one result, but you're free to choose any mapping. A
+    32×32 CTA is 1024 threads; you might have each thread compute several outputs, or a
+    whole warp cooperate on one. The mapping from threads to data is <em>your</em>
+    design decision, not a hardware rule.
+</div>
+
 <h3>Why this matters</h3>
 <ul>
     <li><strong>A CTA never splits across SMs.</strong> All its threads live together — they can share fast SRAM and synchronize with <code>__syncthreads()</code>.</li>
     <li><strong>A warp is the real unit of execution.</strong> The hardware schedules <em>warps</em>, not individual threads. When you call a kernel, what actually runs is "warp 0 issues an instruction; warp 1 issues an instruction; …" — 32 threads at a time.</li>
     <li><strong>Threads inside a warp run in lockstep.</strong> They all execute the same instruction on the same cycle. If 31 are doing useful work and 1 is idle, the warp still takes one cycle.</li>
+    <li><strong>Pick CTA sizes that are multiples of 32.</strong> A CTA of, say, 100 threads still rounds up to 4 warps (128 lanes) with 28 lanes wasted every cycle. In practice people use 128, 256, or 512.</li>
 </ul>
 
 <!-- ===================================================================== -->
-<h2>4. The SM (Streaming Multiprocessor)</h2>
+<h2>5. The SM (Streaming Multiprocessor)</h2>
 
 <p>
     An SM is one of the 22 "mini-processors" on the chip. Think of it as a tiny
@@ -224,6 +481,46 @@
     completely — this is called <strong>latency hiding</strong>, and it's why GPUs care less about caches
     than CPUs do.
 </p>
+
+<h3>Occupancy — how many warps you keep on tap</h3>
+
+<p>
+    Latency hiding only works if there are <em>other</em> warps ready to run. An SM can
+    hold up to <strong>2048 threads (64 warps)</strong> resident at once, and several
+    CTAs share it. But two hard budgets cap how many actually fit:
+</p>
+
+<ul>
+    <li><strong>Registers.</strong> The SM's ~64K registers are split across every
+        resident thread. A kernel that needs 64 registers/thread can keep all 2048
+        threads alive; one that needs 128 registers/thread can only keep 1024.</li>
+    <li><strong>Shared memory.</strong> The 96 KB (228 KB on an H100) is split across
+        resident CTAs. A CTA that grabs 48 KB means at most two CTAs fit per SM.</li>
+</ul>
+
+<div class="callout">
+    <strong>Occupancy</strong> = how many warps (or CTAs) are concurrently resident on
+    an SM, relative to the hardware max. Higher occupancy gives the scheduler more warps
+    to hide latency with — but it's a means, not a goal. A tiling kernel with tons of
+    register reuse can run fast at low occupancy. Chase <em>latency hiding</em>, not the
+    occupancy number itself.
+</div>
+
+<p>
+    One more detail worth carrying into the kernel pages: <strong>bandwidth climbs at
+    every tier, not just latency.</strong> On an H100 the numbers are stark — HBM moves
+    ~3.35 TB/s, SRAM ~31 TB/s, and the register file ~370 TB/s. Same ordering on this
+    card, smaller magnitudes. Keeping a value in registers or shared memory instead of
+    re-fetching it from DRAM isn't a rounding error; it's a 100×-bandwidth decision.
+</p>
+
+<div class="callout warn">
+    <strong>Datacenter aside:</strong> Hopper/Ada SMs add a <strong>Tensor Core</strong>
+    — a dedicated matrix-multiply unit (an H100 hits ~989 TFLOP/s of matmul, vs ~67
+    TFLOP/s of plain FP32). The 1660 Super has <em>none</em>, so on this card every FLOP
+    goes through the 64 CUDA cores. When you read about "keeping the Tensor Core busy,"
+    that's a datacenter concern; here the equivalent goal is keeping the CUDA cores fed.
+</div>
 
 <!-- ===================================================================== -->
 <h2>6. Warps and SIMT — one instruction, 32 threads</h2>
@@ -360,7 +657,116 @@
 </p>
 
 <!-- ===================================================================== -->
-<h2>9. Glossary</h2>
+<h2>9. Mapping work to hardware — tiling, CTAs, and waves</h2>
+
+<p>
+    Take a matrix multiply <code>C[M×N] = A[M×K] · B[K×N]</code>. You don't launch one
+    thread per output — you chop <code>C</code> into rectangular <strong>tiles</strong>
+    and hand <em>one CTA per tile</em>. Each CTA loads its slice of <code>A</code> and
+    <code>B</code> into shared memory, multiplies, and writes its tile of <code>C</code>.
+</p>
+
+<p>
+    The number of tiles <em>is</em> your <strong>grid size</strong>. If <code>C</code>
+    splits into a 3×8 arrangement of tiles, that's <code>gridDim = 24</code> CTAs. Those
+    24 CTAs are independent, so the hardware sprays them across SMs:
+</p>
+
+<ul>
+    <li><strong>Inter-SM: in parallel.</strong> Different CTAs run on different SMs at
+        the same time.</li>
+    <li><strong>Intra-SM: time-sharing.</strong> Several CTAs may be resident on one SM
+        (occupancy permitting), and its warp scheduler interleaves them.</li>
+</ul>
+
+<p>
+    Because an SM runs a bounded number of CTAs at once, the grid is processed in
+    <strong>waves</strong>: the SMs grab a batch of CTAs, finish, then grab the next
+    batch. And here's the trap — if your CTA count spills just past a wave boundary, you
+    pay for a whole extra wave while most SMs sit idle. This is
+    <strong>wave quantization</strong> (the "tail effect").
+</p>
+
+<div class="figure" id="fig-wave">
+    <svg viewBox="0 0 720 300" preserveAspectRatio="xMidYMid meet" aria-label="Wave quantization across SMs">
+        <text x="360" y="24" text-anchor="middle" class="svg-title" id="waveTitle">CTAs are assigned to SMs in waves</text>
+        <g id="waveSMs"></g>
+        <g id="waveBar"></g>
+    </svg>
+    <div class="caption" id="cap-wave">Step through: one full wave, then what one extra CTA costs.</div>
+    <div class="controls">
+        <button data-act="prev">◂ Prev</button>
+        <button data-act="step">Step ▸</button>
+        <button data-act="reset">↺ Reset</button>
+        <span class="tick-label">step 1 / 5</span>
+    </div>
+</div>
+
+<p class="small dim">
+    Diagram uses 4 SMs for legibility; this card has 22. The lesson scales: with 22 SMs,
+    going from 22 to 23 CTAs nearly doubles the runtime of a compute-bound kernel. Size
+    your grid to fill whole waves when you can.
+</p>
+
+<!-- ===================================================================== -->
+<h2>10. Arithmetic intensity — compute-bound vs memory-bound</h2>
+
+<p>
+    Every kernel is limited by <em>one</em> of two things: how fast the cores can compute,
+    or how fast memory can feed them. Which one? Compare the work done per byte moved:
+</p>
+
+<div class="callout">
+    <strong>Arithmetic intensity (AI)</strong> = FLOPs performed ÷ bytes moved from DRAM.
+    Compare it to the machine's <strong>ridge point</strong> = peak FLOP/s ÷ DRAM bandwidth.
+</div>
+
+<p>
+    On this card that's <code>5.0 TFLOP/s ÷ 336 GB/s ≈ 15 FLOP/byte</code>. (An H100 sits
+    far higher: <code>989 TFLOP/s ÷ 3.35 TB/s ≈ 295 FLOP/byte</code> — its enormous Tensor
+    Core throughput makes it much harder to stay compute-bound.)
+</p>
+
+<ul>
+    <li><strong>AI &lt; ridge → memory-bound.</strong> The cores are starved; you're
+        limited by DRAM bandwidth. Optimize the memory traffic.</li>
+    <li><strong>AI &gt; ridge → compute-bound.</strong> Memory keeps up; you're limited
+        by raw FLOP/s. Optimize the arithmetic.</li>
+</ul>
+
+<div class="figure" id="fig-roof">
+    <svg viewBox="0 0 720 400" preserveAspectRatio="xMidYMid meet" aria-label="Roofline model">
+        <g id="roofPlot"></g>
+    </svg>
+    <div class="caption" id="cap-roof">The roofline: a compute ceiling, a memory slope, and the ridge where they meet.</div>
+    <div class="controls">
+        <button data-act="prev">◂ Prev</button>
+        <button data-act="step">Step ▸</button>
+        <button data-act="reset">↺ Reset</button>
+        <span class="tick-label">step 1 / 5</span>
+    </div>
+</div>
+
+<h3>Why tiling and fusion help</h3>
+<p>
+    Both of these raise arithmetic intensity by reusing bytes instead of re-fetching them:
+    a shared-memory <em>tile</em> loads a chunk of DRAM once and does many FLOPs on it;
+    <em>fusion</em> (as in flash attention) avoids writing a big intermediate to DRAM and
+    reading it back. A naive vector add does ~1 FLOP per 12 bytes — hopelessly
+    memory-bound. A well-tiled matmul reuses each loaded value across a whole tile, pushing
+    AI past the ridge and onto the compute ceiling.
+</p>
+
+<div class="callout">
+    <strong>MFU vs MBU.</strong> Two utilization scores tell you how close you are to a
+    roof. <strong>Model FLOPs Utilization</strong> = achieved FLOP/s ÷ peak FLOP/s — how
+    busy the cores are. <strong>Model Bandwidth Utilization</strong> = achieved GB/s ÷
+    peak GB/s — how busy the memory bus is. A compute-bound kernel chases high MFU; a
+    memory-bound kernel chases high MBU. You almost never max both.
+</div>
+
+<!-- ===================================================================== -->
+<h2>11. Glossary</h2>
 
 <table>
 <tr><td class="mono">DRAM</td><td>Off-chip main memory (GDDR6 here). Big, slow, ~336 GB/s on this card.</td></tr>
@@ -375,6 +781,16 @@
 <tr><td class="mono">Coalescing</td><td>Packing the 32 loads of a warp into one DRAM transaction. Achieved by reading consecutive aligned addresses.</td></tr>
 <tr><td class="mono">Bank conflict</td><td>Two threads of a warp hit the same shared-memory bank → serialized.</td></tr>
 <tr><td class="mono">SIMT</td><td>Single Instruction, Multiple Threads — the execution model where one fetched instruction is broadcast to 32 threads.</td></tr>
+<tr><td class="mono">HBM</td><td>High-Bandwidth Memory — the DRAM stacked on datacenter GPUs (this card uses GDDR6 instead). Same role: the GPU's global memory.</td></tr>
+<tr><td class="mono">global memory</td><td>CUDA's name for the GPU's own DRAM (HBM/GDDR6). Every thread can read/write it; slowest tier on the chip.</td></tr>
+<tr><td class="mono">PCIe / NVLink</td><td>Off-chip links: PCIe connects CPU↔GPU (narrow); NVLink connects GPU↔GPU (wide, datacenter only).</td></tr>
+<tr><td class="mono">occupancy</td><td>How many warps/CTAs are concurrently resident on an SM vs the hardware max. Capped by register and shared-memory budgets.</td></tr>
+<tr><td class="mono">blockIdx / threadIdx</td><td>Built-in indices: which CTA in the grid, and which thread in the CTA. With <code>blockDim</code>/<code>gridDim</code> they give each thread its global position.</td></tr>
+<tr><td class="mono">arithmetic intensity</td><td>FLOPs per byte moved from DRAM. Below the ridge point → memory-bound; above → compute-bound.</td></tr>
+<tr><td class="mono">roofline / ridge point</td><td>Model of the two ceilings (compute FLOP/s and memory GB/s). The ridge = peak FLOP/s ÷ bandwidth marks the crossover.</td></tr>
+<tr><td class="mono">MFU / MBU</td><td>Model FLOPs / Bandwidth Utilization — fraction of peak compute / peak bandwidth a kernel achieves.</td></tr>
+<tr><td class="mono">wave quantization</td><td>The tail effect: CTAs spilling just past a wave boundary force a whole extra wave with most SMs idle.</td></tr>
+<tr><td class="mono">Tensor Core</td><td>Dedicated matrix-multiply unit on datacenter GPUs. Not present on the 1660 Super.</td></tr>
 </table>
 
 <footer>
@@ -422,41 +838,6 @@ function mk(tag, attrs = {}, parent = null) {
     if (parent) parent.appendChild(el);
     return el;
 }
-
-// =======================================================================
-// Figure 1: memory hierarchy — a byte travels up
-// =======================================================================
-(function () {
-    const fig = document.getElementById('fig-mem');
-    const packet = fig.querySelector('#bytePacket');
-    const label  = fig.querySelector('#byteLabel');
-
-    const stops = [
-        { x: 360, y: 300, name: 'DRAM',        color: '#cf222e' },
-        { x: 360, y: 195, name: 'L2',          color: '#bf8700' },
-        { x: 360, y: 115, name: 'L1 / shared', color: '#9a6700' },
-        { x: 360, y: 45,  name: 'register',    color: '#1a7f37' }
-    ];
-    function setStop(i, txt) {
-        packet.setAttribute('opacity', 1);
-        packet.setAttribute('transform', `translate(${stops[i].x},${stops[i].y})`);
-        label.textContent = txt;
-        label.setAttribute('fill', stops[i].color);
-    }
-    const ticks = [
-        { caption: 'A byte sits in DRAM, off-chip. ~500 cycles away.',
-          apply: () => setStop(0, 'now in: DRAM') },
-        { caption: 'The load-store unit fetches it; it lands in L2 (~200 cycles total).',
-          apply: () => setStop(1, 'now in: L2') },
-        { caption: 'L2 → L1: now on the same SM as our warp.',
-          apply: () => setStop(2, 'now in: L1 / shared') },
-        { caption: 'Finally loaded into a register — single-cycle access from here.',
-          apply: () => setStop(3, 'now in: register') },
-        { caption: 'A re-read of the same byte is now nearly free. Reusing data is the whole point of caches.',
-          apply: () => setStop(3, 'reuse → register again') },
-    ];
-    new StepFig(fig, ticks);
-})();
 
 // =======================================================================
 // Figure 2: grid → CTA → warp zoom
@@ -661,6 +1042,123 @@ function mk(tag, attrs = {}, parent = null) {
           apply: () => { title.textContent = 'Punchline → see transpose.cu:35';
                          setArrows(ident, '#1a7f37');
                          cap.textContent = '4 bytes of wasted memory, 8× faster shared-memory transpose.'; } },
+    ];
+    new StepFig(fig, ticks);
+})();
+
+// =======================================================================
+// Figure 5: wave quantization — CTAs assigned to SMs in waves
+// =======================================================================
+(function () {
+    const fig = document.getElementById('fig-wave');
+    const smG  = fig.querySelector('#waveSMs');
+    const barG = fig.querySelector('#waveBar');
+    const NSM = 4;
+
+    const smBox = [], smLbl = [];
+    for (let i = 0; i < NSM; i++) {
+        const x = 40 + i * 165;
+        mk('rect', { x, y: 70, width: 135, height: 74, rx: 6, fill: '#ffffff', stroke: '#afb8c1' }, smG);
+        mk('text', { x: x + 67, y: 60, 'text-anchor': 'middle', class: 'svg-dim' }, smG).textContent = 'SM ' + i;
+        smBox.push(mk('rect', { x: x + 16, y: 84, width: 103, height: 46, rx: 4, fill: '#eef2f6', stroke: '#d0d7de' }, smG));
+        smLbl.push(mk('text', { x: x + 67, y: 112, 'text-anchor': 'middle', class: 'svg-lbl' }, smG));
+    }
+
+    mk('text', { x: 118, y: 205, 'text-anchor': 'end', class: 'svg-dim' }, barG).textContent = 'runtime →';
+    const wave1  = mk('rect', { x: 130, y: 188, width: 130, height: 30, rx: 4, fill: '#dafbe1', stroke: '#1a7f37', opacity: 0 }, barG);
+    const wave2  = mk('rect', { x: 268, y: 188, width: 130, height: 30, rx: 4, fill: '#ffebe9', stroke: '#cf222e', opacity: 0 }, barG);
+    const wave1t = mk('text', { x: 195, y: 208, 'text-anchor': 'middle', class: 'svg-lbl', opacity: 0 }, barG); wave1t.textContent = 'wave 1';
+    const wave2t = mk('text', { x: 333, y: 208, 'text-anchor': 'middle', class: 'svg-lbl', opacity: 0 }, barG); wave2t.textContent = 'wave 2';
+
+    function fill(slots, color) {
+        smBox.forEach((b, i) => b.setAttribute('fill', slots[i] ? color : '#eef2f6'));
+        smLbl.forEach((t, i) => { t.textContent = slots[i] || ''; });
+    }
+    function waves(n) {
+        wave1.setAttribute('opacity', n >= 1 ? 1 : 0);
+        wave1t.setAttribute('opacity', n >= 1 ? 1 : 0);
+        wave2.setAttribute('opacity', n >= 2 ? 1 : 0);
+        wave2t.setAttribute('opacity', n >= 2 ? 1 : 0);
+    }
+    const title = fig.querySelector('#waveTitle');
+
+    const ticks = [
+        { caption: '4 SMs, and a grid of 4 CTAs to run. Each CTA is an independent tile of the output.',
+          apply: () => { title.textContent = '4 CTAs on 4 SMs'; fill([null, null, null, null]); waves(0); } },
+        { caption: 'Perfect fit: all 4 CTAs run at once in a single wave. Every SM busy the whole time.',
+          apply: () => { title.textContent = '4 CTAs → 1 wave, 100% busy'; fill(['CTA 0', 'CTA 1', 'CTA 2', 'CTA 3'], '#dafbe1'); waves(1); } },
+        { caption: 'Now the grid has 5 CTAs. Wave 1 still fills all 4 SMs — CTA 4 has to wait.',
+          apply: () => { title.textContent = '5 CTAs → wave 1 fills the SMs'; fill(['CTA 0', 'CTA 1', 'CTA 2', 'CTA 3'], '#dafbe1'); waves(1); } },
+        { caption: 'CTA 4 needs a whole second wave. It runs on one SM while the other three sit idle.',
+          apply: () => { title.textContent = '5 CTAs → wave 2: 3 SMs idle'; fill(['CTA 4', null, null, null], '#ffebe9'); waves(2); } },
+        { caption: 'One extra CTA (4 → 5) nearly doubled the runtime. That is wave quantization — the tail effect.',
+          apply: () => { title.textContent = 'Wave quantization: +1 CTA, ~2× runtime'; fill(['CTA 4', null, null, null], '#ffebe9'); waves(2); } },
+    ];
+    new StepFig(fig, ticks);
+})();
+
+// =======================================================================
+// Figure 6: roofline — compute-bound vs memory-bound
+// =======================================================================
+(function () {
+    const fig = document.getElementById('fig-roof');
+    const g = fig.querySelector('#roofPlot');
+    const L = 72, R = 680, B = 340, T = 55, XMAX = 40, YMAX = 5.5;
+    const PEAK = 5.0, BW = 0.336;          // TFLOP/s, TB/s (=336 GB/s)
+    const RIDGE = PEAK / BW;               // ≈ 14.88 FLOP/byte
+    const xpx = ai => L + (ai / XMAX) * (R - L);
+    const ypx = f  => B - (f / YMAX) * (B - T);
+
+    // axes
+    mk('line', { x1: L, y1: B, x2: R, y2: B, stroke: '#afb8c1', 'stroke-width': 1.5 }, g);
+    mk('line', { x1: L, y1: B, x2: L, y2: T, stroke: '#afb8c1', 'stroke-width': 1.5 }, g);
+    mk('text', { x: (L + R) / 2, y: 386, 'text-anchor': 'middle', class: 'svg-dim' }, g)
+        .textContent = 'arithmetic intensity  (FLOP / byte)  →';
+    mk('text', { x: 22, y: (B + T) / 2, 'text-anchor': 'middle', class: 'svg-dim',
+        transform: `rotate(-90 22 ${(B + T) / 2})` }, g).textContent = 'achievable FLOP/s  →';
+
+    // dynamic elements
+    const ceil = mk('line', { x1: xpx(RIDGE), y1: ypx(PEAK), x2: xpx(XMAX), y2: ypx(PEAK),
+        stroke: '#1a7f37', 'stroke-width': 3, opacity: 0 }, g);
+    const ceilLbl = mk('text', { x: xpx(XMAX) - 4, y: ypx(PEAK) - 8, 'text-anchor': 'end',
+        class: 'svg-lbl', fill: '#1a7f37', opacity: 0 }, g);
+    ceilLbl.textContent = 'compute ceiling · 5.0 TFLOP/s';
+
+    const mem = mk('line', { x1: xpx(0), y1: ypx(0), x2: xpx(RIDGE), y2: ypx(PEAK),
+        stroke: '#cf222e', 'stroke-width': 3, opacity: 0 }, g);
+    const memLbl = mk('text', { x: xpx(3.4), y: ypx(0.4), class: 'svg-lbl', fill: '#cf222e',
+        opacity: 0, transform: `rotate(-34 ${xpx(3.4)} ${ypx(0.4)})` }, g);
+    memLbl.textContent = 'memory roof · 336 GB/s';
+
+    const ridge = mk('line', { x1: xpx(RIDGE), y1: ypx(PEAK), x2: xpx(RIDGE), y2: B,
+        stroke: '#8250df', 'stroke-width': 1.5, 'stroke-dasharray': '4 4', opacity: 0 }, g);
+    const ridgeLbl = mk('text', { x: xpx(RIDGE), y: B + 16, 'text-anchor': 'middle',
+        class: 'svg-dim', fill: '#8250df', opacity: 0 }, g);
+    ridgeLbl.textContent = 'ridge ≈ 15';
+
+    function dot(ai, f, color, label, lx, ly) {
+        const cx = xpx(ai), cy = ypx(f);
+        const c = mk('circle', { cx, cy, r: 6, fill: color, stroke: '#fff', 'stroke-width': 1.5, opacity: 0 }, g);
+        const t = mk('text', { x: cx + lx, y: cy + ly, class: 'svg-lbl', fill: color, opacity: 0 }, g);
+        t.textContent = label;
+        return [c, t];
+    }
+    const [memDotC, memDotT] = dot(2, BW * 2, '#cf222e', 'vector add / softmax (AI≈2)', 10, -8);
+    const [cmpDotC, cmpDotT] = dot(30, PEAK, '#1a7f37', 'tiled matmul (AI≈30)', -8, 20);
+
+    function show(els, on) { els.forEach(e => e.setAttribute('opacity', on ? 1 : 0)); }
+
+    const ticks = [
+        { caption: 'The compute ceiling: 5.0 TFLOP/s. No kernel on this card can exceed it, whatever it does.',
+          apply: () => { show([ceil, ceilLbl], 1); show([mem, memLbl, ridge, ridgeLbl, memDotC, memDotT, cmpDotC, cmpDotT], 0); } },
+        { caption: 'The memory roof: 336 GB/s. A kernel with low arithmetic intensity is pinned under this diagonal.',
+          apply: () => { show([ceil, ceilLbl, mem, memLbl], 1); show([ridge, ridgeLbl, memDotC, memDotT, cmpDotC, cmpDotT], 0); } },
+        { caption: 'They cross at the ridge point: 5000 ÷ 336 ≈ 15 FLOP/byte. Left of it memory-bound, right compute-bound.',
+          apply: () => { show([ceil, ceilLbl, mem, memLbl, ridge, ridgeLbl], 1); show([memDotC, memDotT, cmpDotC, cmpDotT], 0); } },
+        { caption: 'Memory-bound kernels (vector add, softmax, transpose) sit far left, riding the diagonal — bandwidth-limited.',
+          apply: () => { show([ceil, ceilLbl, mem, memLbl, ridge, ridgeLbl, memDotC, memDotT], 1); show([cmpDotC, cmpDotT], 0); } },
+        { caption: 'A well-tiled matmul reuses each loaded byte many times → high AI → it rides the compute ceiling instead.',
+          apply: () => { show([ceil, ceilLbl, mem, memLbl, ridge, ridgeLbl, memDotC, memDotT, cmpDotC, cmpDotT], 1); } },
     ];
     new StepFig(fig, ticks);
 })();

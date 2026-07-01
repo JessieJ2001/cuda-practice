@@ -18,6 +18,7 @@
     <a href="topk.html">topk</a>
     <a href="attention.html">attention</a>
     <a href="flash_attention.html">flash_attention</a>
+    <a href="spmm.html">spmm</a>
     <span class="spacer"></span>
     <span class="dim">target: GTX 1660 Super (Turing TU116)</span>
 </nav>
@@ -101,6 +102,14 @@
                 <div class="stage">step 6 · fused + online softmax</div>
                 <h3>Flash Attention</h3>
                 <p>One kernel, no [M × N] buffer, streaming K/V with a running max and denominator. The trade: re-reading K, V for a clean memory footprint.</p>
+            </a>
+        </div>
+
+        <div class="card">
+            <a href="spmm.html">
+                <div class="stage">step 7 · sparsity + warp-uniform branching</div>
+                <h3>Sparse×Dense MatMul</h3>
+                <p>A is 65% zeros but dense. Skip the multiply on zeros — and lay threads out so the zero-test is warp-uniform, making it divergence-free. Why CSR conversion is a trap for one-shot SpMM.</p>
             </a>
         </div>
     </div>

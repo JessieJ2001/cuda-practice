@@ -22,9 +22,11 @@ ATTENTION_TARGET = attention
 ATTENTION_SOURCE = attention.cu
 FLASH_ATTENTION_TARGET = flash_attention
 FLASH_ATTENTION_SOURCE = flash_attention.cu
+SPMM_TARGET = spmm
+SPMM_SOURCE = spmm.cu
 
 # Default target - build all programs
-all: $(VECTOR_TARGET) $(SOFTMAX_TARGET) $(CONV2D_TARGET) $(TRANSPOSE_TARGET) $(SCAN_TARGET) $(TOPK_TARGET) $(ATTENTION_TARGET) $(FLASH_ATTENTION_TARGET)
+all: $(VECTOR_TARGET) $(SOFTMAX_TARGET) $(CONV2D_TARGET) $(TRANSPOSE_TARGET) $(SCAN_TARGET) $(TOPK_TARGET) $(ATTENTION_TARGET) $(FLASH_ATTENTION_TARGET) $(SPMM_TARGET)
 
 # Compile the vector addition program
 $(VECTOR_TARGET): $(VECTOR_SOURCE)
@@ -57,6 +59,10 @@ $(ATTENTION_TARGET): $(ATTENTION_SOURCE)
 # Compile the flash attention program
 $(FLASH_ATTENTION_TARGET): $(FLASH_ATTENTION_SOURCE)
 	$(NVCC) $(CFLAGS) $(CUDA_ARCH) -o $(FLASH_ATTENTION_TARGET) $(FLASH_ATTENTION_SOURCE)
+
+# Compile the sparse×dense matmul program
+$(SPMM_TARGET): $(SPMM_SOURCE)
+	$(NVCC) $(CFLAGS) $(CUDA_ARCH) -o $(SPMM_TARGET) $(SPMM_SOURCE)
 
 # Vector Addition targets
 # Run with default parameters (1M elements)
@@ -300,6 +306,39 @@ run-attention-compare: $(ATTENTION_TARGET) $(FLASH_ATTENTION_TARGET)
 	@echo "Running flash_attention.cu (1 fused kernel, streaming softmax):"
 	./$(FLASH_ATTENTION_TARGET) 1024 1024 128
 
+# Sparse×Dense MatMul targets (A sparse M×N · B dense N×K -> C M×K)
+# Run with default parameters (512×512×512, 65% zeros, zero-skip kernel)
+run-spmm: $(SPMM_TARGET)
+	./$(SPMM_TARGET)
+
+# Small test case (64×64×64)
+run-spmm-small: $(SPMM_TARGET)
+	./$(SPMM_TARGET) 64 64 64 0.65
+
+# Medium test case (256×256×256)
+run-spmm-medium: $(SPMM_TARGET)
+	./$(SPMM_TARGET) 256 256 256 0.65
+
+# Large test case (1024×1024×1024)
+run-spmm-large: $(SPMM_TARGET)
+	./$(SPMM_TARGET) 1024 1024 1024 0.65
+
+# Custom dims (e.g., make run-spmm-custom M=512 N=512 K=512 S=0.7)
+run-spmm-custom: $(SPMM_TARGET)
+	./$(SPMM_TARGET) $(M) $(N) $(K) $(S)
+
+# Naive dense baseline (sparsity ignored)
+run-spmm-naive: $(SPMM_TARGET)
+	./$(SPMM_TARGET) 512 512 512 0.65 naive
+
+# CSR-conversion path (reports build vs multiply time separately)
+run-spmm-csr: $(SPMM_TARGET)
+	./$(SPMM_TARGET) 512 512 512 0.65 csr
+
+# Compare all three strategies side by side
+run-spmm-compare: $(SPMM_TARGET)
+	./$(SPMM_TARGET) 512 512 512 0.65 compare
+
 # Backward compatibility - run vector addition by default
 run: run-vector
 run-custom: run-vector-custom
@@ -309,7 +348,7 @@ run-large: run-vector-large
 
 # Clean build artifacts
 clean:
-	rm -f $(VECTOR_TARGET) $(SOFTMAX_TARGET) $(CONV2D_TARGET) $(TRANSPOSE_TARGET) $(SCAN_TARGET) $(TOPK_TARGET) $(ATTENTION_TARGET) $(FLASH_ATTENTION_TARGET)
+	rm -f $(VECTOR_TARGET) $(SOFTMAX_TARGET) $(CONV2D_TARGET) $(TRANSPOSE_TARGET) $(SCAN_TARGET) $(TOPK_TARGET) $(ATTENTION_TARGET) $(FLASH_ATTENTION_TARGET) $(SPMM_TARGET)
 
 # Show GPU information
 gpu-info:
@@ -410,6 +449,16 @@ help:
 	@echo "  run-flash-attention-custom M=m N=n D=d - Run with custom dimensions"
 	@echo "  run-attention-compare        - Compare materialized vs. fused attention"
 	@echo ""
+	@echo "Sparse×Dense MatMul (A sparse M×N · B dense N×K -> C M×K):"
+	@echo "  run-spmm               - Run with 512×512×512, 65% zeros (zero-skip)"
+	@echo "  run-spmm-small         - Run with 64×64×64"
+	@echo "  run-spmm-medium        - Run with 256×256×256"
+	@echo "  run-spmm-large         - Run with 1024×1024×1024"
+	@echo "  run-spmm-custom M=.. N=.. K=.. S=.. - Run with custom dims/sparsity"
+	@echo "  run-spmm-naive         - Naive dense baseline (sparsity ignored)"
+	@echo "  run-spmm-csr           - CSR-conversion path (build vs multiply time)"
+	@echo "  run-spmm-compare       - Compare naive vs zero-skip vs CSR"
+	@echo ""
 	@echo "Utilities:"
 	@echo "  clean                  - Remove build artifacts"
 	@echo "  gpu-info               - Show GPU information"
@@ -423,8 +472,10 @@ help:
 	@echo "  make run-transpose-large"
 	@echo "  make run-attention-custom M=128 N=256 D=64"
 	@echo "  make run-flash-attention-large"
+	@echo "  make run-spmm-compare"
+	@echo "  make run-spmm-custom M=512 N=512 K=512 S=0.7"
 
-.PHONY: all $(VECTOR_TARGET) $(SOFTMAX_TARGET) $(CONV2D_TARGET) $(TRANSPOSE_TARGET) $(SCAN_TARGET) $(TOPK_TARGET) $(ATTENTION_TARGET) $(FLASH_ATTENTION_TARGET) run run-custom run-small run-medium run-large \
+.PHONY: all $(VECTOR_TARGET) $(SOFTMAX_TARGET) $(CONV2D_TARGET) $(TRANSPOSE_TARGET) $(SCAN_TARGET) $(TOPK_TARGET) $(ATTENTION_TARGET) $(FLASH_ATTENTION_TARGET) $(SPMM_TARGET) run run-custom run-small run-medium run-large \
         run-vector run-vector-custom run-vector-small run-vector-medium run-vector-large \
         run-softmax run-softmax-test run-softmax-custom run-softmax-small run-softmax-medium run-softmax-large \
         run-conv2d run-conv2d-small run-conv2d-blur run-conv2d-identity run-conv2d-custom run-conv2d-large \
@@ -433,4 +484,5 @@ help:
         run-topk run-topk-test run-topk-small run-topk-medium run-topk-large run-topk-custom run-topk-heap run-topk-compare run-topk-ratios \
         run-attention run-attention-small run-attention-medium run-attention-large run-attention-custom \
         run-flash-attention run-flash-attention-small run-flash-attention-medium run-flash-attention-large run-flash-attention-custom run-attention-compare \
+        run-spmm run-spmm-small run-spmm-medium run-spmm-large run-spmm-custom run-spmm-naive run-spmm-csr run-spmm-compare \
         clean gpu-info cuda-check help

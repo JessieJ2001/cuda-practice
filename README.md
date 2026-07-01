@@ -12,6 +12,7 @@ A small collection of CUDA kernels for learning GPU programming from the ground 
 ├── topk.cu                # 4. radix-bucket selection (no sort)
 ├── attention.cu           # 5. naive 3-kernel scaled dot-product attention
 ├── flash_attention.cu     # 6. fused single-kernel attention with online softmax
+├── spmm.cu                # 7. sparse×dense matmul — divergence-free zero-skip
 ├── common.h               # CHECK_CUDA_ERROR macro and cdiv helper
 ├── Makefile               # build + run targets
 ├── docs/                  # step-by-step HTML walkthroughs (open docs/index.html)
@@ -119,6 +120,15 @@ make run-flash-attention            # same dims as naive attention
 make run-attention-compare          # side-by-side benchmark
 ```
 
+### 7. Sparse×Dense MatMul · [`spmm.cu`](spmm.cu) · [docs →](docs/spmm.html)
+
+`C = A·B` where `A` (M×N) is 60–70% zeros but stored *dense*, `B` (N×K) dense. Three strategies benchmarked: naive dense GEMM, **zero-skip** (skip the FMA + B read when `A==0`), and dense→CSR conversion + CSR-SpMM. The `solve()` entry point uses zero-skip — the key trick is laying threads so a warp spans the *columns of C*, which makes the zero-test **warp-uniform and therefore divergence-free**, with no format conversion and no extra memory. The CSR path is included to show why converting a dense matrix to a sparse format is a trap for a one-shot multiply (it costs two `O(M·N)` passes plus a prefix sum).
+
+```bash
+make run-spmm                       # 512³, 65% zeros, zero-skip
+make run-spmm-compare               # naive vs zero-skip vs CSR (build time broken out)
+```
+
 ## Common Mistakes to Avoid
 
 - **Forgetting bounds checks** — extra threads launched for the tail of a grid must be guarded with `if (idx < N)`.
@@ -139,6 +149,7 @@ make run-attention-compare          # side-by-side benchmark
 - **topk:** `run-topk`, `run-topk-{test,small,medium,large,custom,compare,ratios}`
 - **attention:** `run-attention`, `run-attention-{small,medium,large,custom,compare}`
 - **flash attention:** `run-flash-attention`, `run-flash-attention-{small,medium,large,custom}`
+- **spmm:** `run-spmm`, `run-spmm-{small,medium,large,custom,naive,csr,compare}`
 - **utilities:** `clean`, `gpu-info`, `cuda-check`, `help`
 
 ## Suggested Learning Path
@@ -149,5 +160,6 @@ make run-attention-compare          # side-by-side benchmark
 4. **Top-K** — learn shared-memory histograms and grid-stride loops.
 5. **Attention** — combine everything into a 3-kernel pipeline.
 6. **Flash Attention** — fuse the pipeline and stream through the online-softmax trick.
+7. **Sparse×Dense MatMul** — exploit sparsity, and use the thread layout to keep a data-dependent branch warp-uniform.
 
 Walk through each kernel's `docs/<name>.html` page alongside the source. The pages cite real line numbers from the `.cu` files.

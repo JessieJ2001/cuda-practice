@@ -1,0 +1,487 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Sparse×Dense MatMul — LeetGPU</title>
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+
+<nav class="topnav">
+    <span class="brand">leetgpu/</span>
+    <a href="index.html">index</a>
+    <a href="primer.html">primer</a>
+    <a href="transpose.html">transpose</a>
+    <a href="vector_addition.html">vector_addition</a>
+    <a href="softmax.html">softmax</a>
+    <a href="topk.html">topk</a>
+    <a href="attention.html">attention</a>
+    <a href="flash_attention.html">flash_attention</a>
+    <a href="spmm.html">spmm</a>
+    <span class="spacer"></span>
+    <span class="dim">target: GTX 1660 Super</span>
+</nav>
+
+<main>
+
+<h1>Sparse Matrix × Dense Matrix (SpMM)</h1>
+
+<div class="callout">
+    <strong>TL;DR.</strong> <code>C = A·B</code> with <code>A</code> (M×N) ~65% zeros
+    but stored <em>dense</em>, <code>B</code> (N×K) dense. The winning move is
+    <strong>not</strong> to convert <code>A</code> to a sparse format — the
+    conversion costs a full <code>O(M·N)</code> pass plus a prefix sum, which
+    eats the savings when <code>A</code> is used once. Instead: keep <code>A</code>
+    dense and <strong>skip the multiply when the element is zero</strong>. The
+    trick that makes this fast is the thread layout — let a warp span the
+    <em>columns of C</em>, and the zero-test becomes <strong>warp-uniform</strong>:
+    every lane reads the same <code>A</code> element, takes the same branch, and
+    skips together. <strong>Zero divergence, zero extra memory, no conversion.</strong>
+</div>
+
+<p class="small dim">
+    Source: <a href="../spmm.cu">/workspaces/cuda-practice/spmm.cu</a>.
+    All line numbers below cite that file. Entry point:
+    <code>solve(const float* A, const float* B, float* C, int M, int N, int K, int nnz)</code>
+    — device pointers, result written to <code>C</code>.
+</p>
+
+<div class="legend">
+    <span><span class="swatch" style="background:#ffebe9;border-color:#cf222e"></span>DRAM</span>
+    <span><span class="swatch" style="background:#fff1cf;border-color:#bf8700"></span>L2</span>
+    <span><span class="swatch" style="background:#fff8c5;border-color:#9a6700"></span>L1 / shared</span>
+    <span><span class="swatch" style="background:#dafbe1;border-color:#1a7f37"></span>register</span>
+    <span><span class="swatch" style="background:#fbefff;border-color:#8250df"></span>warp</span>
+</div>
+
+<!-- ===================================================================== -->
+<h2>1. The problem, and the trap</h2>
+
+<p>
+    <code>A</code> is M×N and 60–70% of its entries are zero, but it arrives in
+    plain <strong>row-major dense layout</strong> (plus an <code>nnz</code> count).
+    <code>B</code> is N×K dense. We want <code>C = A·B</code>, M×K.
+</p>
+
+<p>
+    The textbook answer to "matrix is sparse" is "use a sparse format" (CSR) so
+    you only ever touch the non-zeros. That's strategy 3 below — and it's a
+    <strong>trap for a one-shot SpMM</strong>. Converting a dense <code>A</code>
+    into CSR <em>on the GPU</em> requires:
+</p>
+
+<ul>
+    <li>a full <code>O(M·N)</code> read of <code>A</code> to count non-zeros per row,</li>
+    <li>a <strong>prefix sum</strong> over the M row-counts to get the CSR row pointers,</li>
+    <li>a second <code>O(M·N)</code> pass to scatter <code>(column, value)</code> pairs.</li>
+</ul>
+
+<p>
+    If you only multiply once, you've read <code>A</code> twice <em>plus</em> paid
+    for a scan, just to avoid reading it once. The conversion is only worth it if
+    the CSR form is reused many times. So this page builds <strong>three</strong>
+    kernels and measures the trade-off:
+</p>
+
+<table>
+<tr><th>#</th><th>Strategy</th><th>Touches</th><th>Conversion</th><th>Extra memory</th></tr>
+<tr><td>1</td><td><code>spmmDenseNaive</code> — full GEMM</td><td>all M·N·K</td><td>none</td><td>none</td></tr>
+<tr><td>2</td><td><code>spmmZeroSkip</code> — <strong>solve() uses this</strong></td><td>~35% of M·N·K</td><td>none</td><td>none</td></tr>
+<tr><td>3</td><td>CSR build + <code>spmmCSR</code></td><td>nnz·K</td><td><strong>O(M·N) + scan</strong></td><td>nnz floats+ints</td></tr>
+</table>
+
+<!-- ===================================================================== -->
+<h2>2. Launch configuration</h2>
+
+<p>
+    One thread per output element <code>C[row][col]</code>. The block is 16×16;
+    <strong>x indexes the K columns of C, y indexes the M rows</strong>
+    (<code>spmm.cu:155–159</code>):
+</p>
+
+<div class="code-block">
+<pre data-start-line="154" style="--start-line: 154;"><code><span class="line"><span class="ty">void</span> <span class="fn">solve</span>(<span class="kw">const</span> <span class="ty">float</span>* A, <span class="kw">const</span> <span class="ty">float</span>* B, <span class="ty">float</span>* C, <span class="ty">int</span> M, <span class="ty">int</span> N, <span class="ty">int</span> K, <span class="ty">int</span> nnz) {</span><span class="line">    (<span class="ty">void</span>)nnz;  <span class="cmt">// not needed by the zero-skip strategy</span></span><span class="line">    <span class="ty">dim3</span> block(TILE, TILE);                 <span class="cmt">// 16×16 = 256 threads</span></span><span class="line">    <span class="ty">dim3</span> grid(<span class="fn">cdiv</span>(K, TILE), <span class="fn">cdiv</span>(M, TILE));  <span class="cmt">// x = K cols, y = M rows</span></span><span class="line">    <span class="fn">spmmZeroSkip</span>&lt;&lt;&lt;grid, block&gt;&gt;&gt;(A, B, C, M, N, K);</span><span class="line">}</span></code></pre>
+</div>
+
+<p>
+    Why x→columns and not x→rows? Because the warp is 32 threads with
+    consecutive <code>threadIdx.x</code>. Mapping x to the <em>columns of C</em>
+    is what makes both the coalescing <em>and</em> the divergence-free zero-skip
+    work. That single decision is the whole kernel. §4 shows why.
+</p>
+
+<!-- ===================================================================== -->
+<h2>3. Strategy 1 — the dense baseline</h2>
+
+<p>Plain GEMM, sparsity ignored, so we can measure what skipping actually buys
+   (<code>spmm.cu:46–57</code>):</p>
+
+<div class="code-block">
+<pre data-start-line="46" style="--start-line: 46;"><code><span class="line"><span class="kw">__global__</span> <span class="ty">void</span> <span class="fn">spmmDenseNaive</span>(<span class="kw">const</span> <span class="ty">float</span>* A, <span class="kw">const</span> <span class="ty">float</span>* B, <span class="ty">float</span>* C,</span><span class="line">                               <span class="ty">int</span> M, <span class="ty">int</span> N, <span class="ty">int</span> K) {</span><span class="line">    <span class="ty">int</span> col = blockIdx.x * blockDim.x + threadIdx.x;   <span class="cmt">// over K</span></span><span class="line">    <span class="ty">int</span> row = blockIdx.y * blockDim.y + threadIdx.y;   <span class="cmt">// over M</span></span><span class="line">    <span class="kw">if</span> (row &gt;= M || col &gt;= K) <span class="kw">return</span>;</span><span class="line"></span><span class="line">    <span class="ty">float</span> acc = 0.0f;</span><span class="line">    <span class="kw">for</span> (<span class="ty">int</span> n = 0; n &lt; N; n++)</span><span class="line">        acc += A[row * N + n] * B[n * K + col];        <span class="cmt">// multiplies even when A==0</span></span><span class="line">    C[row * K + col] = acc;</span><span class="line">}</span></code></pre>
+</div>
+
+<p>
+    Correct, but it does the full <code>M·N·K</code> FMAs and — worse on this
+    memory-bound problem — reads every <code>B</code> row for every output row,
+    even where <code>A</code> is zero. ~65% of that B traffic is wasted.
+</p>
+
+<!-- ===================================================================== -->
+<h2>4. Strategy 2 — zero-skip, and why it's divergence-free</h2>
+
+<p>One line longer than the baseline (<code>spmm.cu:74–91</code>):</p>
+
+<div class="code-block">
+<pre data-start-line="74" style="--start-line: 74;"><code><span class="line"><span class="kw">__global__</span> <span class="ty">void</span> <span class="fn">spmmZeroSkip</span>(<span class="kw">const</span> <span class="ty">float</span>* A, <span class="kw">const</span> <span class="ty">float</span>* B, <span class="ty">float</span>* C,</span><span class="line">                             <span class="ty">int</span> M, <span class="ty">int</span> N, <span class="ty">int</span> K) {</span><span class="line">    <span class="ty">int</span> col = blockIdx.x * blockDim.x + threadIdx.x;   <span class="cmt">// over K</span></span><span class="line">    <span class="ty">int</span> row = blockIdx.y * blockDim.y + threadIdx.y;   <span class="cmt">// over M</span></span><span class="line">    <span class="kw">if</span> (row &gt;= M || col &gt;= K) <span class="kw">return</span>;</span><span class="line"></span><span class="line">    <span class="ty">float</span> acc = 0.0f;</span><span class="line">    <span class="kw">const</span> <span class="ty">float</span>* Arow = A + (<span class="ty">size_t</span>)row * N;</span><span class="line">    <span class="kw">for</span> (<span class="ty">int</span> n = 0; n &lt; N; n++) {</span><span class="line">        <span class="ty">float</span> a = Arow[n];                 <span class="cmt">// warp-uniform broadcast load</span></span><span class="line">        <span class="kw">if</span> (a != 0.0f)                     <span class="cmt">// warp-uniform branch (no divergence)</span></span><span class="line">            acc += a * B[(<span class="ty">size_t</span>)n * K + col];   <span class="cmt">// coalesced over col</span></span><span class="line">    }</span><span class="line">    C[(<span class="ty">size_t</span>)row * K + col] = acc;</span><span class="line">}</span></code></pre>
+</div>
+
+<p>
+    Take one warp: 32 lanes with consecutive <code>threadIdx.x</code> and the
+    <em>same</em> <code>threadIdx.y</code>. So every lane in the warp shares the
+    same <code>row</code>, and they cover 32 consecutive <code>col</code> values.
+    Now look at each line of the loop:
+</p>
+
+<ul>
+    <li><strong><code>a = Arow[n]</code></strong> — <code>row</code> and <code>n</code>
+        are identical across the warp, so all 32 lanes read the
+        <em>same address</em>. The hardware serves this as a single
+        <strong>broadcast</strong> load, cached in L1/L2.</li>
+    <li><strong><code>if (a != 0.0f)</code></strong> — the condition depends only
+        on <code>(row, n)</code>, both warp-uniform. So the predicate is the
+        <em>same for all 32 lanes</em>: the entire warp either does the work or
+        skips it together. <span style="color:var(--good);">No warp
+        divergence.</span> This is the crux — a zero-skip that would normally
+        shred a warp into divergent paths is here perfectly uniform, purely
+        because the warp spans <em>columns</em>, not the sparse dimension.</li>
+    <li><strong><code>B[n*K + col]</code></strong> — <code>n</code> is uniform,
+        <code>col</code> is consecutive → consecutive addresses → one
+        <strong>coalesced</strong> 128-byte transaction.</li>
+</ul>
+
+<div class="figure" id="fig-zs">
+    <svg viewBox="0 0 720 400" preserveAspectRatio="xMidYMid meet">
+        <text x="120" y="20" text-anchor="middle" class="svg-title">A row (DRAM)</text>
+        <text x="360" y="20" text-anchor="middle" class="svg-title">warp: 8 lanes, same row, cols 0..7</text>
+        <text x="600" y="20" text-anchor="middle" class="svg-title">B / C (DRAM)</text>
+
+        <g id="zsArow" transform="translate(40,40)"></g>
+        <g id="zsWarp" transform="translate(250,150)"></g>
+        <g id="zsB"    transform="translate(520,40)"></g>
+
+        <text id="zsN" x="120" y="240" text-anchor="middle" class="svg-dim">n = 0</text>
+        <g id="zsBcast" opacity="0">
+            <path d="M 150 60 Q 230 130 250 175" stroke="#8250df" stroke-width="2.5" fill="none" marker-end="url(#zsArrP)"/>
+            <text x="210" y="115" text-anchor="middle" class="svg-lbl" fill="#8250df">1 broadcast read</text>
+        </g>
+        <g id="zsBranch" opacity="0">
+            <rect x="248" y="148" width="210" height="64" rx="6" fill="none" stroke="#0969da" stroke-width="2.5" stroke-dasharray="5 4"/>
+            <text id="zsBranchTxt" x="353" y="240" text-anchor="middle" class="svg-lbl" fill="#0969da">if (a != 0): whole warp agrees</text>
+        </g>
+        <g id="zsBread" opacity="0">
+            <path d="M 460 180 Q 500 150 520 130" stroke="#1a7f37" stroke-width="2.5" fill="none" marker-end="url(#zsArrG)"/>
+            <text x="500" y="300" text-anchor="middle" class="svg-lbl" fill="#1a7f37">8 consecutive B → 1 coalesced read</text>
+        </g>
+
+        <defs>
+            <marker id="zsArrP" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#8250df"/></marker>
+            <marker id="zsArrG" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#1a7f37"/></marker>
+        </defs>
+    </svg>
+    <div class="caption" id="cap-zs">A warp spans columns of C, so the sparse dimension n is warp-uniform.</div>
+    <div class="controls">
+        <button data-act="prev">◂ Prev</button>
+        <button data-act="step">Step ▸</button>
+        <button data-act="reset">↺ Reset</button>
+        <span class="tick-label">step 1 / 5</span>
+    </div>
+</div>
+
+<div class="callout good">
+    The standard objection to zero-skipping on a GPU — "data-dependent branches
+    cause warp divergence" — <strong>does not apply here</strong>. The branch
+    variable is the sparse element <code>A[row][n]</code>, and every lane in the
+    warp shares the same <code>row</code> and <code>n</code>. The branch is
+    uniform by construction. With 65% zeros the warp skips ~65% of its
+    coalesced B reads and FMAs, with no penalty.
+</div>
+
+<p>
+    Note <code>nnz</code> is unused by this kernel — it doesn't need to know how
+    sparse <code>A</code> is, only which elements happen to be zero. We keep the
+    parameter because the <code>solve</code> signature is fixed.
+</p>
+
+<!-- ===================================================================== -->
+<h2>5. Strategy 3 — CSR conversion, and what it costs</h2>
+
+<p>
+    The "proper" sparse approach. Build CSR from dense <code>A</code> in three
+    kernels, then a CSR-SpMM that only touches non-zeros
+    (<code>spmm.cu:101–147</code>):
+</p>
+
+<div class="code-block">
+<pre data-start-line="101" style="--start-line: 101;"><code><span class="line"><span class="kw">__global__</span> <span class="ty">void</span> <span class="fn">csrRowCountKernel</span>(...)  <span class="cmt">// thread/row: count nonzeros</span></span><span class="line"><span class="kw">__global__</span> <span class="ty">void</span> <span class="fn">exclusiveScanKernel</span>(...) <span class="cmt">// rowPtr = prefix sum of counts</span></span><span class="line"><span class="kw">__global__</span> <span class="ty">void</span> <span class="fn">csrFillKernel</span>(...)      <span class="cmt">// thread/row: scatter (col,val)</span></span><span class="line"><span class="kw">__global__</span> <span class="ty">void</span> <span class="fn">spmmCSRKernel</span>(...)      <span class="cmt">// C[r][k] = Σ vals[i]·B[colIdx[i]][k]</span></span></code></pre>
+</div>
+
+<p>
+    The multiply (<code>spmmCSRKernel</code>) is genuinely less work — it loops
+    only over a row's non-zeros, and the inner access <code>B[colIdx[i]*K + col]</code>
+    is still coalesced over <code>col</code>. But getting there costs the
+    conversion pipeline, and one stage is a real bottleneck:
+</p>
+
+<div class="callout warn">
+    <strong>The scan is the tax.</strong> Turning per-row non-zero <em>counts</em>
+    into CSR <em>row pointers</em> is a prefix sum. The version in
+    <code>spmm.cu:111</code> is a deliberately simple single-thread serial scan
+    — correct, but <code>O(M)</code> on one lane while the rest of the GPU idles.
+    A production implementation would use the parallel Blelloch scan from
+    <a href="topk.html">topk</a>/scan. Either way, you've now read <code>A</code>
+    twice and run a scan to avoid reading it once. <code>run-spmm-csr</code>
+    prints the build time and the multiply time <em>separately</em> so you can
+    see the conversion dominate at these sizes.
+</div>
+
+<div class="figure" id="fig-csr">
+    <svg viewBox="0 0 720 320" preserveAspectRatio="xMidYMid meet">
+        <text x="360" y="20" text-anchor="middle" class="svg-title">Dense A → CSR pipeline</text>
+        <defs>
+            <marker id="csrArr" markerWidth="9" markerHeight="9" refX="8" refY="3" orient="auto"><path d="M0,0 L0,6 L8,3 z" fill="#0969da"/></marker>
+        </defs>
+        <g id="csrStages"></g>
+        <text id="csrNote" x="360" y="300" text-anchor="middle" class="svg-dim"></text>
+    </svg>
+    <div class="caption" id="cap-csr">Step through the four stages and see which one stalls the GPU.</div>
+    <div class="controls">
+        <button data-act="prev">◂ Prev</button>
+        <button data-act="step">Step ▸</button>
+        <button data-act="reset">↺ Reset</button>
+        <span class="tick-label">step 1 / 5</span>
+    </div>
+</div>
+
+<!-- ===================================================================== -->
+<h2>6. Memory-hierarchy story (zero-skip kernel)</h2>
+
+<table>
+<tr><th>Per inner step</th><th>Where bytes live</th><th>Coalesced / shared?</th><th>Cost</th></tr>
+<tr><td><code>a = Arow[n]</code></td><td>DRAM → L2 → L1 → register</td><td>warp-uniform → 1 broadcast</td><td>~1 transaction, cached across the warp</td></tr>
+<tr><td><code>if (a != 0)</code></td><td>register (predicate)</td><td>warp-uniform</td><td>free — no divergence, no mask</td></tr>
+<tr><td><code>B[n*K+col]</code></td><td>DRAM → L2 → register</td><td><span style="color:var(--good);">coalesced (consecutive col)</span></td><td>1×128 B transaction / 32 lanes — <em>skipped when a==0</em></td></tr>
+<tr><td><code>acc += a*B</code></td><td>register</td><td>—</td><td>1 FMA — <em>skipped when a==0</em></td></tr>
+<tr><td><code>C[row*K+col]=acc</code></td><td>register → L2 → DRAM</td><td><span style="color:var(--good);">coalesced</span></td><td>1 write per output, once</td></tr>
+</table>
+
+<p>
+    The whole point: ~65% of the iterations skip the only two expensive things
+    (the B DRAM read and the FMA) for the <em>entire warp at once</em>, while the
+    cheap broadcast of <code>A</code> is what feeds the decision.
+</p>
+
+<!-- ===================================================================== -->
+<h2>7. Why not shared-memory tiling?</h2>
+
+<p>
+    A dense GEMM would tile <code>B</code> into shared memory to reuse it across
+    rows. Here that helps less: the access into <code>B</code> is
+    <em>data-dependent</em> (which <code>n</code> rows you touch depends on where
+    <code>A</code>'s non-zeros are), so a fixed tiling schedule loads B rows the
+    warp then skips. The zero-skip kernel instead leans on the L2 cache: because
+    every row's <code>B[n*K+col]</code> for a popular column <code>n</code> is
+    the same line, the 1.5 MB L2 on the 1660 Super absorbs a lot of the reuse
+    for free. Tiling is the next optimization if the problem were compute-bound;
+    at 65% sparsity it is firmly memory-bound and skipping wins first.
+</p>
+
+<!-- ===================================================================== -->
+<h2>8. Pitfalls and gotchas</h2>
+
+<ul>
+    <li><strong>Mapping x to rows instead of columns.</strong> Then a warp spans
+        the M dimension, <code>A[row][n]</code> is <em>different</em> per lane,
+        and the zero-test <em>does</em> diverge — plus the B read stops
+        coalescing. The thread layout is the optimization.</li>
+    <li><strong>Comparing floats with <code>== 0.0f</code> on generated data.</strong>
+        Fine here because the sparsity pattern writes exact <code>0.0f</code>.
+        If zeros came from arithmetic you'd want a tolerance, not equality.</li>
+    <li><strong>Sizing the CSR arrays.</strong> <code>colIdx</code>/<code>vals</code>
+        must hold exactly <code>nnz</code> entries — that's why the problem gives
+        you <code>nnz</code> up front (the CSR path needs it; zero-skip does not).</li>
+    <li><strong>Serial scan at large M.</strong> The single-thread
+        <code>exclusiveScanKernel</code> is correct but will dominate CSR build
+        time as M grows; swap in a parallel scan for real use.</li>
+    <li><strong>Integer overflow on indices.</strong> Row/col offsets are cast to
+        <code>size_t</code> before multiplying by N/K so large matrices don't
+        wrap a 32-bit index.</li>
+</ul>
+
+<footer>
+    Source: <code>spmm.cu</code> in this repo. Run
+    <code>make run-spmm-compare</code> to see naive vs zero-skip vs CSR
+    (with conversion time broken out) side by side. The entry point
+    <code>solve()</code> uses the zero-skip kernel.
+</footer>
+
+</main>
+
+<!-- ===================================================================== -->
+<!-- Step-by-step figure controller — same as the other pages              -->
+<!-- ===================================================================== -->
+<script>
+class StepFig {
+    constructor(figEl, ticks) {
+        this.fig = figEl; this.ticks = ticks; this.idx = 0;
+        this.cap = figEl.querySelector('.caption');
+        this.tickLabel = figEl.querySelector('.tick-label');
+        this.btnPrev  = figEl.querySelector('[data-act=prev]');
+        this.btnStep  = figEl.querySelector('[data-act=step]');
+        this.btnReset = figEl.querySelector('[data-act=reset]');
+        if (this.btnPrev)  this.btnPrev.addEventListener('click', () => this.prev());
+        if (this.btnStep)  this.btnStep.addEventListener('click', () => this.step());
+        if (this.btnReset) this.btnReset.addEventListener('click', () => this.reset());
+        this.render();
+    }
+    render() {
+        this.ticks[this.idx].apply();
+        if (this.cap) this.cap.textContent = this.ticks[this.idx].caption;
+        if (this.tickLabel) this.tickLabel.textContent = `step ${this.idx + 1} / ${this.ticks.length}`;
+        if (this.btnPrev) this.btnPrev.disabled = (this.idx === 0);
+        if (this.btnStep) this.btnStep.disabled = (this.idx === this.ticks.length - 1);
+    }
+    step()  { if (this.idx < this.ticks.length - 1) { this.idx++; this.render(); } }
+    prev()  { if (this.idx > 0) { this.idx--; this.render(); } }
+    reset() { this.idx = 0; this.render(); }
+}
+
+const NS = 'http://www.w3.org/2000/svg';
+function mk(tag, attrs = {}, parent = null) {
+    const el = document.createElementNS(NS, tag);
+    for (const k in attrs) el.setAttribute(k, attrs[k]);
+    if (parent) parent.appendChild(el);
+    return el;
+}
+
+// ===================================================================
+// Figure A: zero-skip warp-uniform broadcast + coalesced B
+// ===================================================================
+(function () {
+    const fig = document.getElementById('fig-zs');
+    const aG = fig.querySelector('#zsArow');
+    const wG = fig.querySelector('#zsWarp');
+    const bG = fig.querySelector('#zsB');
+    const nTx = fig.querySelector('#zsN');
+    const bcast = fig.querySelector('#zsBcast');
+    const branch = fig.querySelector('#zsBranch');
+    const branchTxt = fig.querySelector('#zsBranchTxt');
+    const bread = fig.querySelector('#zsBread');
+
+    // A row: 8 cells, pattern of zeros (0 = zero)
+    const Arow = [3, 0, 0, 5, 0, 2, 0, 0];
+    const aCells = [];
+    for (let i = 0; i < 8; i++) {
+        aCells.push(mk('rect', { x: i*26, y: 0, width: 24, height: 24, rx: 3,
+            fill: Arow[i] ? '#ffebe9' : '#f0f0f0', stroke: '#cf222e' }, aG));
+        mk('text', { x: i*26 + 12, y: 16, 'text-anchor': 'middle', class: 'svg-lbl' }, aG)
+            .textContent = Arow[i] ? Arow[i] : '0';
+    }
+    // warp lanes (8) and B cells (8)
+    const lanes = [], bCells = [];
+    for (let i = 0; i < 8; i++) {
+        lanes.push(mk('rect', { x: i*26, y: 0, width: 24, height: 22, rx: 3,
+            fill: '#fbefff', stroke: '#8250df' }, wG));
+        mk('text', { x: i*26 + 12, y: 15, 'text-anchor': 'middle', class: 'svg-lbl' }, wG)
+            .textContent = 'L' + i;
+        bCells.push(mk('rect', { x: 0, y: i*22, width: 70, height: 20, rx: 3,
+            fill: '#ffebe9', stroke: '#cf222e' }, bG));
+    }
+
+    function setState(s) {
+        nTx.textContent = 'n = ' + s.n;
+        aCells.forEach((c, i) => c.setAttribute('fill',
+            i === s.n ? (Arow[i] ? '#ffd1c9' : '#d9d9d9')
+                      : (Arow[i] ? '#ffebe9' : '#f0f0f0')));
+        bcast.setAttribute('opacity', s.bcast);
+        branch.setAttribute('opacity', s.branch);
+        bread.setAttribute('opacity', s.bread);
+        const nz = Arow[s.n] !== 0;
+        branchTxt.textContent = nz
+            ? 'a = ' + Arow[s.n] + ' ≠ 0  →  whole warp does the FMA'
+            : 'a = 0  →  whole warp SKIPS together';
+        branchTxt.setAttribute('fill', nz ? '#1a7f37' : '#cf222e');
+        lanes.forEach(l => l.setAttribute('fill', s.branch ? (nz ? '#dafbe1' : '#f0f0f0') : '#fbefff'));
+        bCells.forEach(b => b.setAttribute('fill', s.bread && nz ? '#b6e3c4' : '#ffebe9'));
+    }
+
+    const ticks = [
+        { caption: 'A warp = 8 lanes, all on the SAME row of C, covering 8 consecutive columns. n starts at 0.',
+          apply: () => setState({ n:0, bcast:0, branch:0, bread:0 }) },
+        { caption: 'n=0: A[row][0]=3. All 8 lanes read the SAME A address → one broadcast load.',
+          apply: () => setState({ n:0, bcast:1, branch:0, bread:0 }) },
+        { caption: 'The branch a≠0 is identical for all 8 lanes (same row, same n). No divergence — the warp agrees.',
+          apply: () => setState({ n:0, bcast:1, branch:1, bread:0 }) },
+        { caption: 'a≠0, so the warp reads 8 consecutive B[0][col] → one coalesced transaction, then 8 FMAs.',
+          apply: () => setState({ n:0, bcast:1, branch:1, bread:1 }) },
+        { caption: 'Advance to n=1: A[row][1]=0. The whole warp takes the SAME branch and SKIPS the B read + FMA. ~65% of n do this.',
+          apply: () => setState({ n:1, bcast:1, branch:1, bread:0 }) },
+    ];
+    new StepFig(fig, ticks);
+})();
+
+// ===================================================================
+// Figure B: dense -> CSR pipeline, with the scan flagged as the stall
+// ===================================================================
+(function () {
+    const fig = document.getElementById('fig-csr');
+    const g = fig.querySelector('#csrStages');
+    const note = fig.querySelector('#csrNote');
+
+    const stages = [
+        { t: 'dense A', d: 'M×N in DRAM (65% zeros)' },
+        { t: 'rowCount', d: 'thread/row, parallel' },
+        { t: 'scan', d: 'rowPtr = prefix sum' },
+        { t: 'fill', d: 'scatter (col,val), parallel' },
+        { t: 'spmmCSR', d: 'multiply, only nnz' },
+    ];
+    const boxes = [];
+    for (let i = 0; i < stages.length; i++) {
+        const x = 30 + i * 138;
+        const r = mk('rect', { x, y: 90, width: 118, height: 60, rx: 6,
+            fill: '#f6f8fa', stroke: '#d0d7de' }, g);
+        mk('text', { x: x + 59, y: 115, 'text-anchor': 'middle', class: 'svg-title' }, g)
+            .textContent = stages[i].t;
+        mk('text', { x: x + 59, y: 135, 'text-anchor': 'middle', class: 'svg-dim' }, g)
+            .textContent = stages[i].d;
+        if (i < stages.length - 1)
+            mk('line', { x1: x + 118, y1: 120, x2: x + 138, y2: 120,
+                stroke: '#0969da', 'stroke-width': 2,
+                'marker-end': 'url(#csrArr)' }, g);
+        boxes.push(r);
+    }
+
+    function hi(idx, color, msg) {
+        boxes.forEach((b, i) => {
+            b.setAttribute('fill', i === idx ? color : '#f6f8fa');
+            b.setAttribute('stroke', i === idx ? color.replace('e9','22') : '#d0d7de');
+        });
+        note.textContent = msg;
+    }
+    const ticks = [
+        { caption: 'Start: A is dense in DRAM. We will convert it to CSR in three stages, then multiply.',
+          apply: () => hi(0, '#ffebe9', 'Two full O(M·N) passes over A are coming just to build CSR.') },
+        { caption: 'Stage 1 — rowCount: one thread per row counts its non-zeros. Fully parallel, fast.',
+          apply: () => hi(1, '#dafbe1', 'Parallel: 22 SMs busy. Cost ≈ one O(M·N) read of A.') },
+        { caption: 'Stage 2 — scan: prefix-sum the counts into CSR row pointers. THIS is the bottleneck.',
+          apply: () => hi(2, '#fff1cf', 'Serial single-thread scan in spmm.cu:111 → GPU idles. Bottleneck.') },
+        { caption: 'Stage 3 — fill: scatter (col,val) pairs. Parallel again, second O(M·N) read of A.',
+          apply: () => hi(3, '#dafbe1', "A has now been read twice — just to avoid reading it once.") },
+        { caption: 'Stage 4 — spmmCSR: the actual multiply, only over non-zeros. Cheap. But look at the total.',
+          apply: () => hi(4, '#dafbe1', 'Multiply is cheap; build dominates for a one-shot SpMM. Hence solve() = zero-skip.') },
+    ];
+    new StepFig(fig, ticks);
+})();
+</script>
+</body>
+</html>
